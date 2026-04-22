@@ -1,0 +1,33 @@
+[project]
+name = "clawbooks"
+version = "0.1.0"
+description = "Compliance-first CLI bookkeeping for a single-member LLC"
+readme = "README.md"
+requires-python = ">=3.14"
+dependencies = [
+  "alembic>=1.16.0,<2",
+  "pydantic>=2.11.0,<3",
+  "rich>=14.0.0,<15",
+  "sqlalchemy>=2.0.0,<3",
+  "stripe>=13.0.0,<14",
+  "typer>=0.16.0,<1",
+]
+
+[project.scripts]
+clawbooks = "clawbooks.cli:app"
+
+[build-system]
+requires = ["setuptools>=69", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools]
+packages = ["clawbooks"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[dependency-groups]
+dev = [
+  "pytest>=8.3.0,<9",
+]
