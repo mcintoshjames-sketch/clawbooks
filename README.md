@@ -2,6 +2,10 @@
 
 Compliance-first CLI bookkeeping for a single-member Illinois LLC.
 
+## Agent Guide
+
+For an AI-operator manual with workflows, guardrails, and exact command patterns, see [AGENT_GUIDE.md](AGENT_GUIDE.md).
+
 ## Quick Start
 
 ```bash
