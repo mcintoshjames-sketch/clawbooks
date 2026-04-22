@@ -28,10 +28,15 @@ def make_engine(ledger_dir: Path) -> Engine:
     return engine
 
 
-def create_schema(ledger_dir: Path) -> None:
-    paths = ledger_paths(ledger_dir)
+def ensure_schema(ledger_dir: Path) -> Engine:
     engine = make_engine(ledger_dir)
     Base.metadata.create_all(engine)
+    return engine
+
+
+def create_schema(ledger_dir: Path) -> None:
+    paths = ledger_paths(ledger_dir)
+    engine = ensure_schema(ledger_dir)
     with engine.begin() as connection:
         connection.execute(text("PRAGMA journal_mode=WAL"))
     paths["db"].touch(exist_ok=True)
@@ -46,7 +51,7 @@ def require_initialized(ledger_dir: Path) -> None:
 @contextmanager
 def session_scope(ledger_dir: Path) -> Session:
     require_initialized(ledger_dir)
-    engine = make_engine(ledger_dir)
+    engine = ensure_schema(ledger_dir)
     session_factory = sessionmaker(engine, expire_on_commit=False, future=True)
     session = session_factory()
     try:

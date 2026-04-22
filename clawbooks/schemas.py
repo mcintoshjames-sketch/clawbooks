@@ -48,7 +48,7 @@ class StripeEvent(BaseModel):
     occurred_at: datetime
     amount_cents: int
     fee_cents: int = 0
-    tax_cents: int = 0
+    tax_cents: int | None = None
     net_cents: int | None = None
     currency: str = "USD"
     description: str = ""
@@ -74,3 +74,35 @@ class ExportManifest(BaseModel):
     period_start: date
     period_end: date
     ledger_path: Path
+
+
+class SalesTaxRegistration(BaseModel):
+    jurisdiction: str
+    filing_cadence: str
+    active: bool = True
+
+
+class PayrollProfile(BaseModel):
+    confirmed: bool = False
+    enabled: bool | None = None
+    provider: str | None = None
+    states: list[str] = Field(default_factory=list)
+
+
+class ContractorProfile(BaseModel):
+    confirmed: bool = False
+    requires_1099_nec_documents: bool | None = None
+    handled_by: str | None = None
+
+
+class OwnerTrackingProfile(BaseModel):
+    estimated_tax_confirmations: bool = False
+
+
+class ComplianceProfile(BaseModel):
+    entity_tax_classification: str = "single_member_llc_disregarded"
+    sales_tax_profile_confirmed: bool = False
+    sales_tax_registrations: list[SalesTaxRegistration] = Field(default_factory=list)
+    payroll: PayrollProfile = Field(default_factory=PayrollProfile)
+    contractor_profile: ContractorProfile = Field(default_factory=ContractorProfile)
+    owner_tracking: OwnerTrackingProfile = Field(default_factory=OwnerTrackingProfile)

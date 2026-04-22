@@ -52,10 +52,6 @@ class JournalEntry(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     reversal_of_entry_id: Mapped[int | None] = mapped_column(ForeignKey("journal_entries.id"), default=None)
     import_run_id: Mapped[int | None] = mapped_column(ForeignKey("imports.id"), default=None)
-    review_required: Mapped[bool] = mapped_column(Boolean, default=False)
-    review_message: Mapped[str | None] = mapped_column(Text, default=None)
-    review_acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
-    cash_basis_included: Mapped[bool] = mapped_column(Boolean, default=True)
 
     lines: Mapped[list["JournalLine"]] = relationship(back_populates="entry", cascade="all, delete-orphan")
 
@@ -71,6 +67,38 @@ class JournalLine(Base):
 
     entry: Mapped[JournalEntry] = relationship(back_populates="lines")
     account: Mapped[Account] = relationship(back_populates="journal_lines")
+    source_settlements: Mapped[list["SettlementApplication"]] = relationship(
+        back_populates="source_line",
+        foreign_keys="SettlementApplication.source_line_id",
+    )
+    settlement_applications: Mapped[list["SettlementApplication"]] = relationship(
+        back_populates="settlement_line",
+        foreign_keys="SettlementApplication.settlement_line_id",
+    )
+    reconciliation_matches: Mapped[list["ReconciliationMatch"]] = relationship(back_populates="journal_line")
+
+
+class SettlementApplication(Base):
+    __tablename__ = "settlement_applications"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    source_line_id: Mapped[int] = mapped_column(ForeignKey("journal_lines.id"), index=True)
+    settlement_line_id: Mapped[int] = mapped_column(ForeignKey("journal_lines.id"), index=True)
+    applied_amount_cents: Mapped[int] = mapped_column(Integer)
+    applied_date: Mapped[date] = mapped_column(Date, index=True)
+    application_type: Mapped[str] = mapped_column(String(32), default="manual")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    reversed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    reversal_reason: Mapped[str | None] = mapped_column(Text, default=None)
+
+    source_line: Mapped[JournalLine] = relationship(
+        back_populates="source_settlements",
+        foreign_keys=[source_line_id],
+    )
+    settlement_line: Mapped[JournalLine] = relationship(
+        back_populates="settlement_applications",
+        foreign_keys=[settlement_line_id],
+    )
 
 
 class ExternalEvent(Base):
@@ -85,6 +113,41 @@ class ExternalEvent(Base):
     payload_json: Mapped[str] = mapped_column(Text)
     import_run_id: Mapped[int | None] = mapped_column(ForeignKey("imports.id"), default=None)
     journal_entry_id: Mapped[int | None] = mapped_column(ForeignKey("journal_entries.id"), default=None)
+    refresh_history: Mapped[list["ExternalEventRefreshHistory"]] = relationship(
+        back_populates="external_event",
+        cascade="all, delete-orphan",
+    )
+
+
+class ExternalEventRefreshHistory(Base):
+    __tablename__ = "external_event_refresh_history"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    external_event_id: Mapped[int] = mapped_column(ForeignKey("external_events.id"), index=True)
+    refreshed_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    payload_json: Mapped[str] = mapped_column(Text)
+    refresh_source: Mapped[str] = mapped_column(String(64))
+    change_note: Mapped[str | None] = mapped_column(Text, default=None)
+
+    external_event: Mapped[ExternalEvent] = relationship(back_populates="refresh_history")
+
+
+class ReviewBlocker(Base):
+    __tablename__ = "review_blockers"
+    __table_args__ = (UniqueConstraint("provider", "external_id", "blocker_type", name="uq_review_blockers_provider_id"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    blocker_type: Mapped[str] = mapped_column(String(64), index=True)
+    provider: Mapped[str] = mapped_column(String(64), index=True)
+    external_id: Mapped[str] = mapped_column(String(255), index=True)
+    status: Mapped[str] = mapped_column(String(32), default="open", index=True)
+    blocker_date: Mapped[date] = mapped_column(Date, index=True)
+    opened_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    resolved_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    resolution_type: Mapped[str | None] = mapped_column(String(64), default=None)
+    resolution_note: Mapped[str | None] = mapped_column(Text, default=None)
+    resolution_entry_id: Mapped[int | None] = mapped_column(ForeignKey("journal_entries.id"), default=None)
+    external_event_id: Mapped[int | None] = mapped_column(ForeignKey("external_events.id"), default=None)
 
 
 class ReconciliationSession(Base):
@@ -95,6 +158,7 @@ class ReconciliationSession(Base):
     statement_path: Mapped[str | None] = mapped_column(String(500), default=None)
     statement_start: Mapped[date] = mapped_column(Date)
     statement_end: Mapped[date] = mapped_column(Date)
+    statement_starting_balance_cents: Mapped[int] = mapped_column(Integer)
     statement_ending_balance_cents: Mapped[int] = mapped_column(Integer)
     status: Mapped[str] = mapped_column(String(32), default="open")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -102,6 +166,10 @@ class ReconciliationSession(Base):
 
     account: Mapped[Account] = relationship()
     lines: Mapped[list["ReconciliationLine"]] = relationship(back_populates="session", cascade="all, delete-orphan")
+    events: Mapped[list["ReconciliationSessionEvent"]] = relationship(
+        back_populates="session",
+        cascade="all, delete-orphan",
+    )
 
 
 class ReconciliationLine(Base):
@@ -113,10 +181,37 @@ class ReconciliationLine(Base):
     description: Mapped[str] = mapped_column(String(500))
     amount_cents: Mapped[int] = mapped_column(Integer)
     external_ref: Mapped[str | None] = mapped_column(String(255), default=None)
-    matched_entry_id: Mapped[int | None] = mapped_column(ForeignKey("journal_entries.id"), default=None)
-    status: Mapped[str] = mapped_column(String(32), default="draft")
+    status: Mapped[str] = mapped_column(String(32), default="open")
 
     session: Mapped[ReconciliationSession] = relationship(back_populates="lines")
+    matches: Mapped[list["ReconciliationMatch"]] = relationship(back_populates="reconciliation_line", cascade="all, delete-orphan")
+
+
+class ReconciliationMatch(Base):
+    __tablename__ = "reconciliation_matches"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    reconciliation_line_id: Mapped[int] = mapped_column(ForeignKey("reconciliation_lines.id"), index=True)
+    journal_line_id: Mapped[int] = mapped_column(ForeignKey("journal_lines.id"), index=True)
+    applied_amount_cents: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    reversed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    reversal_reason: Mapped[str | None] = mapped_column(Text, default=None)
+
+    reconciliation_line: Mapped[ReconciliationLine] = relationship(back_populates="matches")
+    journal_line: Mapped[JournalLine] = relationship(back_populates="reconciliation_matches")
+
+
+class ReconciliationSessionEvent(Base):
+    __tablename__ = "reconciliation_session_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    session_id: Mapped[int] = mapped_column(ForeignKey("reconciliation_sessions.id"), index=True)
+    event_type: Mapped[str] = mapped_column(String(32), index=True)
+    reason: Mapped[str | None] = mapped_column(Text, default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    session: Mapped[ReconciliationSession] = relationship(back_populates="events")
 
 
 class TaxObligation(Base):
@@ -158,6 +253,37 @@ class Attachment(Base):
     sha256: Mapped[str] = mapped_column(String(64))
     description: Mapped[str | None] = mapped_column(String(500), default=None)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+
+class Document(Base):
+    __tablename__ = "documents"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    document_type: Mapped[str] = mapped_column(String(64), index=True)
+    tax_year: Mapped[int] = mapped_column(Integer, index=True)
+    period_start: Mapped[date | None] = mapped_column(Date, default=None)
+    period_end: Mapped[date | None] = mapped_column(Date, default=None)
+    scope: Mapped[str] = mapped_column(String(32), index=True, default="business")
+    original_filename: Mapped[str] = mapped_column(String(255))
+    stored_path: Mapped[str] = mapped_column(String(500))
+    sha256: Mapped[str] = mapped_column(String(64), index=True)
+    notes: Mapped[str | None] = mapped_column(Text, default=None)
+    created_via: Mapped[str] = mapped_column(String(32), default="manual")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    links: Mapped[list["DocumentLink"]] = relationship(back_populates="document", cascade="all, delete-orphan")
+
+
+class DocumentLink(Base):
+    __tablename__ = "document_links"
+    __table_args__ = (UniqueConstraint("document_id", "target_type", "target_id", name="uq_document_links"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    document_id: Mapped[int] = mapped_column(ForeignKey("documents.id"), index=True)
+    target_type: Mapped[str] = mapped_column(String(32), index=True)
+    target_id: Mapped[int] = mapped_column(Integer, index=True)
+
+    document: Mapped[Document] = relationship(back_populates="links")
 
 
 class Setting(Base):

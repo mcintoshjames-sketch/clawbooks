@@ -9,7 +9,7 @@ from textual.widgets import Button, Input, Static, TabbedContent
 from clawbooks.cli import app as cli_app
 from clawbooks.db import session_scope
 from clawbooks.models import JournalEntry
-from clawbooks.tui import ClawbooksTuiApp, ExportPane, HelpPane, MainScreen, ReportPane
+from clawbooks.tui import ClawbooksTuiApp, ExportPane, HelpPane, MainScreen, ReportPane, StatusPane
 from tests.helpers import init_ledger, record_expense, runner
 
 
@@ -121,11 +121,21 @@ async def test_tui_exports_and_surfaces_output_path(tmp_path) -> None:
     ledger = init_ledger(tmp_path)
     today = date.today()
     record_expense(ledger, entry_date=today, vendor="Hosting", amount="10.00")
+    packet_doc = tmp_path / "stripe_1099_k.pdf"
+    packet_doc.write_text("stripe-doc", encoding="utf-8")
 
     app = ClawbooksTuiApp(ledger_dir=ledger)
     async with app.run_test(size=(120, 40)) as pilot:
         await pilot.press("e")
         exports = app.screen.query_one("#exports-pane", ExportPane)
+        app.screen.query_one("#document-source-path", Input).value = str(packet_doc)
+        app.screen.query_one("#document-type", Input).value = "stripe_1099_k"
+        app.screen.query_one("#document-year", Input).value = str(today.year)
+        app.screen.query_one("#document-scope", Input).value = "business"
+        app.screen.query_one("#add-document", Button).press()
+        await pilot.pause()
+        assert "Added document" in widget_text(app.screen.query_one("#document-notice", Static))
+
         app.screen.query_one("#export-period-start", Input).value = today.replace(day=1).isoformat()
         app.screen.query_one("#export-period-end", Input).value = today.isoformat()
         await pilot.click("#prepare-period-export")
@@ -145,6 +155,34 @@ async def test_tui_exports_and_surfaces_output_path(tmp_path) -> None:
         assert exports.result is not None
         assert any(file_name == "manifest.json" for file_name in exports.result.files)
 
+        app.screen.query_one("#export-packet-year", Input).value = str(today.year)
+        app.screen.query_one("#prepare-accountant-packet-export", Button).press()
+        await pilot.pause()
+        assert exports.pending_export is not None
+        app.screen.query_one("#confirm-export", Button).press()
+        await pilot.pause()
+        assert exports.result is not None
+        assert exports.result.zip_path is not None
+        assert exports.result.zip_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_tui_status_includes_packet_sections(tmp_path) -> None:
+    ledger = init_ledger(tmp_path)
+    app = ClawbooksTuiApp(ledger_dir=ledger)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.press("s")
+        status_pane = app.screen.query_one("#status-pane", StatusPane)
+        await pilot.pause()
+        assert status_pane.view is not None
+        titles = [section.title for section in status_pane.view.sections]
+        assert "Compliance Profile" in titles
+        assert "Document Registry" in titles
+        assert "Accountant Packet Checklist" in titles
+        assert "Missing Packet Items" in titles
+        assert "Unknown Packet Items" in titles
+        assert app.screen.query_one("#status-year", Input).value == str(date.today().year)
+
 
 @pytest.mark.asyncio
 async def test_tui_help_shows_cli_handoff_without_mutating_ledger(tmp_path) -> None:
@@ -157,7 +195,7 @@ async def test_tui_help_shows_cli_handoff_without_mutating_ledger(tmp_path) -> N
         await pilot.pause()
         help_pane = app.screen.query_one("#help-pane", HelpPane)
         commands = help_pane.commands
-        assert any("period close" in command.command for command in commands)
+        assert any("review list" in command.command for command in commands)
         assert any("expense record" in command.command for command in commands)
         with session_scope(ledger) as session:
             after_count = session.query(JournalEntry).count()

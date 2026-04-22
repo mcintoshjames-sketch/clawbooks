@@ -3,7 +3,7 @@ from __future__ import annotations
 from datetime import date
 
 from clawbooks.tui_facade import TuiFacade
-from tests.helpers import init_ledger, record_expense
+from tests.helpers import add_document, init_ledger, record_expense
 
 
 def test_tui_facade_normalizes_dashboard_and_reports(tmp_path) -> None:
@@ -31,18 +31,31 @@ def test_tui_facade_normalizes_dashboard_and_reports(tmp_path) -> None:
 
 def test_tui_facade_status_and_help_commands(tmp_path) -> None:
     ledger = init_ledger(tmp_path)
+    support_doc = tmp_path / "prior-year-return.pdf"
+    support_doc.write_text("return", encoding="utf-8")
+    add_document(ledger, source_path=support_doc, document_type="prior_year_return", year=date.today().year, scope="owner")
     facade = TuiFacade(ledger)
 
     status = facade.status()
     assert [section.title for section in status.sections] == [
+        "Compliance Profile",
         "Chart of Accounts",
         "Tax Obligations",
         "Reconciliation Sessions",
         "Import History",
-        "Review-Required Entries",
+        "Document Registry",
+        "Accountant Packet Checklist",
+        "Missing Packet Items",
+        "Unknown Packet Items",
+        "Review Blockers",
         "Period Events",
     ]
+    assert status.packet_year == date.today().year
+    assert any(section.title == "Document Registry" and section.rows for section in status.sections)
 
     commands = facade.help_commands()
+    assert sorted(facade.available_document_types())
     assert any(command.title == "Import Stripe" for command in commands)
-    assert any("period close" in command.command for command in commands)
+    assert any(command.title == "Add document" for command in commands)
+    assert any(command.title == "Settlement" for command in commands)
+    assert any("compliance profile show" in command.command for command in commands)

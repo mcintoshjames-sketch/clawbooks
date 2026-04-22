@@ -38,3 +38,30 @@ def record_expense(ledger: Path, *, entry_date: date, vendor: str, amount: str, 
         payment_account,
     )
     assert result.exit_code == 0, result.stdout
+
+
+def add_document(
+    ledger: Path,
+    *,
+    source_path: Path,
+    document_type: str,
+    year: int,
+    scope: str = "business",
+    notes: str | None = None,
+) -> None:
+    args = [
+        "document",
+        "add",
+        "--source-path",
+        str(source_path),
+        "--type",
+        document_type,
+        "--year",
+        str(year),
+        "--scope",
+        scope,
+    ]
+    if notes is not None:
+        args.extend(["--notes", notes])
+    result = invoke_cli(ledger, *args)
+    assert result.exit_code == 0, result.stdout

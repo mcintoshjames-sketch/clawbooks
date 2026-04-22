@@ -9,11 +9,22 @@ from sqlalchemy import func, select
 
 from clawbooks.config import is_ledger_dir, load_config, validate_ledger_dir
 from clawbooks.db import session_scope
-from clawbooks.ledger import account_balance_as_of, display_balance, list_accounts
-from clawbooks.models import Account, ImportRun, JournalEntry, PeriodLock, ReconciliationSession, TaxObligation
+from clawbooks.ledger import (
+    DOCUMENT_TYPES,
+    account_balance_as_of,
+    create_document,
+    display_balance,
+    get_compliance_profile,
+    list_accounts,
+    list_documents,
+    serialize_document,
+)
+from clawbooks.models import Account, ImportRun, PeriodLock, ReconciliationSession, ReviewBlocker, TaxObligation
 from clawbooks.reports import (
     balance_sheet,
     cash_flow,
+    document_checklist,
+    export_accountant_packet,
     export_bundle,
     export_year_end,
     general_ledger,
@@ -99,13 +110,10 @@ class TuiFacade:
                 select(func.count(TaxObligation.id)).where(TaxObligation.status != "completed")
             ) or 0
             open_reconciliations = session.scalar(
-                select(func.count(ReconciliationSession.id)).where(ReconciliationSession.status != "closed")
+                select(func.count(ReconciliationSession.id)).where(ReconciliationSession.status == "open")
             ) or 0
-            review_required = session.scalar(
-                select(func.count(JournalEntry.id)).where(
-                    JournalEntry.review_required.is_(True),
-                    JournalEntry.review_acknowledged_at.is_(None),
-                )
+            open_blockers = session.scalar(
+                select(func.count(ReviewBlocker.id)).where(ReviewBlocker.status == "open")
             ) or 0
             latest_event = session.scalar(select(PeriodLock).order_by(PeriodLock.created_at.desc(), PeriodLock.id.desc()))
 
@@ -124,8 +132,10 @@ class TuiFacade:
                 )
 
         alerts = []
-        if review_required:
-            alerts.append(f"{review_required} review-required journal entr{'y' if review_required == 1 else 'ies'} need attention.")
+        for warning in ytd.get("warnings", []):
+            alerts.append(warning)
+        if open_blockers:
+            alerts.append(f"{open_blockers} open review blocker{'s' if open_blockers != 1 else ''} require resolution.")
 
         return DashboardSummary(
             business_name=self.business_name,
@@ -135,6 +145,7 @@ class TuiFacade:
                 Metric("YTD Net Income", format_money(ytd["totals"]["net_income_cents"])),
                 Metric("Pending Tax Obligations", str(int(pending_obligations))),
                 Metric("Open Reconciliations", str(int(open_reconciliations))),
+                Metric("Open Review Blockers", str(int(open_blockers)), tone="warning" if open_blockers else "default"),
                 Metric("Latest Period Event", latest_period_event_label(latest_event), tone="warning" if latest_event else "default"),
             ],
             sections=[
@@ -173,13 +184,13 @@ class TuiFacade:
             if report_key == "pnl":
                 payload = pnl(session, period_start=start, period_end=end, basis=self.config.default_report_basis)
             elif report_key == "balance_sheet":
-                payload = balance_sheet(session, as_of=as_of, basis=self.config.default_report_basis)
+                payload = balance_sheet(session, as_of=as_of)
             elif report_key == "cash_flow":
                 payload = cash_flow(session, period_start=start, period_end=end)
             elif report_key == "trial_balance":
                 payload = trial_balance(session, as_of=as_of)
             elif report_key == "general_ledger":
-                payload = general_ledger(session, period_start=start, period_end=end)
+                payload = general_ledger(session, period_start=start, period_end=end, include_line_ids=True)
             elif report_key == "tax_liabilities":
                 payload = tax_liabilities(session, as_of=as_of)
             elif report_key == "owner_equity":
@@ -189,9 +200,11 @@ class TuiFacade:
 
         return self._normalize_report(descriptor, payload, start=start, end=end, as_of=as_of)
 
-    def status(self, *, as_of: date | None = None) -> StatusView:
+    def status(self, *, as_of: date | None = None, packet_year: int | None = None) -> StatusView:
         as_of = as_of or date.today()
+        packet_year = packet_year or as_of.year
         with session_scope(self.ledger_dir) as session:
+            profile = get_compliance_profile(session).model_dump()
             accounts_rows = [
                 {
                     "code": account.code,
@@ -218,6 +231,8 @@ class TuiFacade:
                     "account_id": item.account_id,
                     "statement_start": item.statement_start,
                     "statement_end": item.statement_end,
+                    "statement_starting_balance_cents": item.statement_starting_balance_cents,
+                    "statement_ending_balance_cents": item.statement_ending_balance_cents,
                     "status": item.status,
                 }
                 for item in session.scalars(select(ReconciliationSession).order_by(ReconciliationSession.id.desc()).limit(20))
@@ -232,20 +247,17 @@ class TuiFacade:
                 }
                 for item in session.scalars(select(ImportRun).order_by(ImportRun.started_at.desc(), ImportRun.id.desc()).limit(20))
             ]
-            review_rows = [
+            blocker_rows = [
                 {
-                    "entry_id": item.id,
-                    "entry_date": item.entry_date,
-                    "description": item.description,
-                    "source_type": item.source_type,
-                    "review_message": item.review_message or "",
+                    "review_blocker_id": item.id,
+                    "provider": item.provider,
+                    "external_id": item.external_id,
+                    "blocker_type": item.blocker_type,
+                    "status": item.status,
+                    "blocker_date": item.blocker_date,
+                    "resolution_type": item.resolution_type or "",
                 }
-                for item in session.scalars(
-                    select(JournalEntry)
-                    .where(JournalEntry.review_required.is_(True), JournalEntry.review_acknowledged_at.is_(None))
-                    .order_by(JournalEntry.entry_date.desc(), JournalEntry.id.desc())
-                    .limit(20)
-                )
+                for item in session.scalars(select(ReviewBlocker).order_by(ReviewBlocker.blocker_date.desc(), ReviewBlocker.id.desc()).limit(20))
             ]
             period_rows = [
                 {
@@ -258,24 +270,56 @@ class TuiFacade:
                 }
                 for item in session.scalars(select(PeriodLock).order_by(PeriodLock.created_at.desc(), PeriodLock.id.desc()).limit(20))
             ]
+            document_rows = [
+                {key: value for key, value in serialize_document(item).items() if key != "links"}
+                for item in list_documents(session, tax_year=packet_year)
+            ]
+            checklist = document_checklist(session, ledger_dir=self.ledger_dir, year=packet_year)
 
+        profile_rows = [{"key": key, "value": value} for key, value in profile.items()]
         return StatusView(
             as_of=as_of,
+            packet_year=packet_year,
             sections=[
+                TableSection("Compliance Profile", ["key", "value"], profile_rows, "No compliance profile configured."),
                 TableSection("Chart of Accounts", ["code", "name", "kind", "subtype", "is_active"], accounts_rows, "No accounts found."),
                 TableSection("Tax Obligations", ["code", "description", "jurisdiction", "due_date", "status"], obligations_rows, "No tax obligations found."),
                 TableSection(
                     "Reconciliation Sessions",
-                    ["session_id", "account_id", "statement_start", "statement_end", "status"],
+                    ["session_id", "account_id", "statement_start", "statement_end", "statement_starting_balance_cents", "statement_ending_balance_cents", "status"],
                     reconciliation_rows,
                     "No reconciliation sessions found.",
                 ),
                 TableSection("Import History", ["import_run_id", "source", "status", "started_at", "source_path"], import_rows, "No imports recorded."),
                 TableSection(
-                    "Review-Required Entries",
-                    ["entry_id", "entry_date", "description", "source_type", "review_message"],
-                    review_rows,
-                    "No review-required entries.",
+                    "Document Registry",
+                    ["document_id", "document_type", "tax_year", "scope", "original_filename", "link_summary"],
+                    document_rows,
+                    "No documents recorded for the selected packet year.",
+                ),
+                TableSection(
+                    "Accountant Packet Checklist",
+                    ["item_key", "title", "status", "document_count", "required_count"],
+                    checklist["rows"],
+                    "No checklist items available.",
+                ),
+                TableSection(
+                    "Missing Packet Items",
+                    ["item_key", "title", "status", "required_count"],
+                    checklist["missing_items"],
+                    "No missing packet items.",
+                ),
+                TableSection(
+                    "Unknown Packet Items",
+                    ["item_key", "title", "status", "required_count"],
+                    checklist["unknown_items"],
+                    "No unknown packet items.",
+                ),
+                TableSection(
+                    "Review Blockers",
+                    ["review_blocker_id", "provider", "external_id", "blocker_type", "status", "blocker_date", "resolution_type"],
+                    blocker_rows,
+                    "No review blockers.",
                 ),
                 TableSection(
                     "Period Events",
@@ -291,12 +335,43 @@ class TuiFacade:
         prefix = f"uv run clawbooks --ledger '{ledger}' --json"
         return [
             HelpCommand("Record expense", "Use the CLI for new manual expenses.", f"{prefix} expense record --date YYYY-MM-DD --vendor 'Vendor' --amount 0.00 --category 5199 --payment-account 1000"),
+            HelpCommand("Add document", "Register source or tax documents with the packet builder.", f"{prefix} document add --source-path /path/to/file.pdf --type stripe_1099_k --year YYYY"),
             HelpCommand("Import Stripe", "Stripe imports stay in the CLI in v1.", f"{prefix} import stripe --from-date YYYY-MM-DD --to-date YYYY-MM-DD --dry-run"),
-            HelpCommand("Import CSV", "CSV imports stay in the CLI in v1.", f"{prefix} import csv --account-code 1000 --csv-path /path/to/file.csv --profile-path /path/to/profile.json --dry-run"),
-            HelpCommand("Reconcile", "Reconciliation stays in the CLI in v1.", f"{prefix} reconcile start --account-code 1000 --statement-path /path/to/statement.csv --statement-start YYYY-MM-DD --statement-end YYYY-MM-DD --statement-ending-balance 0.00"),
-            HelpCommand("Close period", "Period close stays in the CLI in v1.", f"{prefix} period close --period-start YYYY-MM-DD --period-end YYYY-MM-DD"),
-            HelpCommand("Reopen period", "Period reopen stays in the CLI in v1.", f"{prefix} period reopen --period-start YYYY-MM-DD --period-end YYYY-MM-DD --reason 'Reason'"),
+            HelpCommand("Import CSV", "CSV imports stay in the CLI in v1.", f"{prefix} import csv --account-code 1000 --csv-path /path/to/file.csv --profile-path /path/to/profile.json --statement-starting-balance 0.00 --statement-ending-balance 0.00 --dry-run"),
+            HelpCommand("Reconcile", "Use candidate discovery and amount-based matching in the CLI; void mistaken sessions instead of replacing them in place.", f"{prefix} reconcile candidates --session-id 1"),
+            HelpCommand("Settlement", "Explicit settlement drives supported cash-basis reporting, but immediate-cash entries cannot double as settlement cash.", f"{prefix} settlement apply --source-line-id 10 --settlement-line-id 42 --amount 100.00"),
+            HelpCommand("Review blockers", "List open blockers first; retry refreshes current Stripe facts instead of replaying stale payloads.", f"{prefix} review list --status open"),
+            HelpCommand("Compliance profile", "Checklist applicability comes from the compliance profile.", f"{prefix} compliance profile show"),
         ]
+
+    def available_document_types(self) -> list[str]:
+        return sorted(DOCUMENT_TYPES)
+
+    def add_document(
+        self,
+        *,
+        source_path: Path,
+        document_type: str,
+        year: int,
+        scope: str,
+        period_start: date | None = None,
+        period_end: date | None = None,
+        notes: str | None = None,
+    ) -> dict[str, object]:
+        with session_scope(self.ledger_dir) as session:
+            document = create_document(
+                session,
+                ledger_dir=self.ledger_dir,
+                source_path=source_path,
+                document_type=document_type,
+                tax_year=year,
+                scope=scope,
+                period_start=period_start,
+                period_end=period_end,
+                notes=notes,
+            )
+            session.commit()
+        return serialize_document(document)
 
     def export_period_end(self, *, start: date, end: date) -> ExportResult:
         with session_scope(self.ledger_dir) as session:
@@ -315,6 +390,16 @@ class TuiFacade:
             payload = export_year_end(session, ledger_dir=self.ledger_dir, config=self.config, year=year)
         return ExportResult(title="Year-End Export", output_dir=Path(payload["output_dir"]), files=list(payload["files"]))
 
+    def export_accountant_packet(self, *, year: int) -> ExportResult:
+        with session_scope(self.ledger_dir) as session:
+            payload = export_accountant_packet(session, ledger_dir=self.ledger_dir, config=self.config, year=year)
+        return ExportResult(
+            title="Accountant Packet Export",
+            output_dir=Path(payload["output_dir"]),
+            files=list(payload["files"]),
+            zip_path=Path(payload["zip_path"]),
+        )
+
     def _normalize_report(
         self,
         descriptor: ReportDescriptor,
@@ -331,7 +416,13 @@ class TuiFacade:
                 Metric("Net Income", format_money(payload["totals"]["net_income_cents"])),
             ]
             sections = [
-                TableSection("Accounts", ["code", "name", "kind", "display_amount_cents"], payload["rows"], "No profit and loss activity.")
+                TableSection("Accounts", ["code", "name", "kind", "display_amount_cents"], payload["rows"], "No profit and loss activity."),
+                TableSection(
+                    "Unsupported Cash-Basis Exclusions",
+                    ["line_id", "entry_id", "entry_date", "account_code", "excluded_amount_cents", "reason"],
+                    payload.get("excluded_lines", []),
+                    "No unsupported cash-basis exclusions.",
+                ),
             ]
         elif descriptor.key == "balance_sheet":
             metrics = [
@@ -371,10 +462,9 @@ class TuiFacade:
                     "entry_id": entry["entry_id"],
                     "entry_date": entry["entry_date"],
                     "source_type": entry["source_type"],
-                    "review_required": entry["review_required"],
                     "description": entry["description"],
                     "lines": "; ".join(
-                        f"{line['account_code']} {format_money(int(line['amount_cents']))}"
+                        f"{line.get('line_id', '?')}:{line['account_code']} {format_money(int(line['amount_cents']))}"
                         for line in entry["lines"]
                     ),
                 }
@@ -384,7 +474,7 @@ class TuiFacade:
             sections = [
                 TableSection(
                     "Journal Entries",
-                    ["entry_id", "entry_date", "source_type", "review_required", "description", "lines"],
+                    ["entry_id", "entry_date", "source_type", "description", "lines"],
                     rows,
                     "No journal activity.",
                 )

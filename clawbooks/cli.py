@@ -14,28 +14,48 @@ from clawbooks.config import ledger_paths, load_config, validate_ledger_dir, wri
 from clawbooks.db import create_schema, session_scope
 from clawbooks.exceptions import AppError, ValidationError
 from clawbooks.ledger import (
+    DOCUMENT_SCOPES,
+    DOCUMENT_TYPES,
+    UNSET,
     JournalLineInput,
     add_account,
+    apply_settlement,
     close_period,
     close_reconciliation,
+    create_document,
     deactivate_account,
+    get_compliance_profile,
     import_csv,
     import_stripe,
     infer_kind_from_subtype,
     list_accounts,
+    list_documents,
     list_reconciliation_sessions,
+    list_review_blockers,
+    list_settlements,
     match_reconciliation,
     period_status,
     post_journal_entry,
+    reconciliation_candidates,
     record_expense,
+    reopen_reconciliation,
     reopen_period,
+    resolve_review_blocker,
+    reverse_settlement,
     reverse_entry,
     seed_defaults,
+    set_compliance_profile,
     start_reconciliation,
+    serialize_document,
+    retry_review_blocker,
+    update_document,
+    void_reconciliation,
 )
 from clawbooks.reports import (
     balance_sheet,
     cash_flow,
+    document_checklist,
+    export_accountant_packet,
     export_bundle,
     export_year_end,
     general_ledger,
@@ -46,7 +66,7 @@ from clawbooks.reports import (
     tax_rollforward,
     trial_balance,
 )
-from clawbooks.schemas import ResultEnvelope
+from clawbooks.schemas import ComplianceProfile, ResultEnvelope
 from clawbooks.utils import format_money, parse_date, parse_money
 
 app = typer.Typer(no_args_is_help=True, add_completion=False)
@@ -60,6 +80,11 @@ report_app = typer.Typer(no_args_is_help=True)
 tax_app = typer.Typer(no_args_is_help=True)
 period_app = typer.Typer(no_args_is_help=True)
 export_app = typer.Typer(no_args_is_help=True)
+document_app = typer.Typer(no_args_is_help=True)
+settlement_app = typer.Typer(no_args_is_help=True)
+review_app = typer.Typer(no_args_is_help=True)
+compliance_app = typer.Typer(no_args_is_help=True)
+profile_app = typer.Typer(no_args_is_help=True)
 
 app.add_typer(coa_app, name="coa")
 app.add_typer(account_app, name="account")
@@ -71,6 +96,11 @@ app.add_typer(report_app, name="report")
 app.add_typer(tax_app, name="tax")
 app.add_typer(period_app, name="period")
 app.add_typer(export_app, name="export")
+app.add_typer(document_app, name="document")
+app.add_typer(settlement_app, name="settlement")
+app.add_typer(review_app, name="review")
+app.add_typer(compliance_app, name="compliance")
+compliance_app.add_typer(profile_app, name="profile")
 
 console = Console()
 
@@ -383,11 +413,13 @@ def expense_record(
     reimbursement: bool = typer.Option(False, "--reimbursement"),
     dry_run: bool = typer.Option(False, "--dry-run"),
 ) -> None:
+    state: CLIState = ctx.obj
     _run_session_command(
         ctx,
         "expense record",
         lambda session: record_expense(
             session,
+            ledger_dir=state.ledger_dir,
             entry_date=parse_date(entry_date),
             vendor=vendor,
             amount=amount,
@@ -424,9 +456,8 @@ def journal_add(
                     description=description,
                     lines=lines,
                     source_type="manual",
-                    cash_basis_included=not non_cash,
                 ).id,
-                "cash_basis_included": not non_cash,
+                "non_cash_hint": non_cash,
             }
         },
         dry_run=dry_run,
@@ -483,17 +514,21 @@ def import_csv_command(
     account_code: str = typer.Option(..., "--account-code"),
     csv_path: Path = typer.Option(..., "--csv-path"),
     profile_path: Path = typer.Option(..., "--profile-path"),
+    statement_starting_balance: str | None = typer.Option(None, "--statement-starting-balance"),
     statement_ending_balance: str | None = typer.Option(None, "--statement-ending-balance"),
     dry_run: bool = typer.Option(False, "--dry-run"),
 ) -> None:
+    state: CLIState = ctx.obj
     _run_session_command(
         ctx,
         "import csv",
         lambda session: import_csv(
             session,
+            ledger_dir=state.ledger_dir,
             account_code=account_code,
             csv_path=csv_path,
             profile_path=profile_path,
+            statement_starting_balance=statement_starting_balance,
             statement_ending_balance=statement_ending_balance,
             dry_run=dry_run,
         ),
@@ -508,19 +543,24 @@ def reconcile_start(
     statement_path: Path = typer.Option(..., "--statement-path"),
     statement_start: str = typer.Option(..., "--statement-start"),
     statement_end: str = typer.Option(..., "--statement-end"),
+    statement_starting_balance: str = typer.Option(..., "--statement-starting-balance"),
     statement_ending_balance: str = typer.Option(..., "--statement-ending-balance"),
     dry_run: bool = typer.Option(False, "--dry-run"),
 ) -> None:
+    state: CLIState = ctx.obj
     _run_session_command(
         ctx,
         "reconcile start",
         lambda session: start_reconciliation(
             session,
+            ledger_dir=state.ledger_dir,
             account_code=account_code,
             statement_path=statement_path,
             statement_start=parse_date(statement_start),
             statement_end=parse_date(statement_end),
+            statement_starting_balance=statement_starting_balance,
             statement_ending_balance=statement_ending_balance,
+            dry_run=dry_run,
         ),
         dry_run=dry_run,
     )
@@ -531,14 +571,33 @@ def reconcile_match(
     ctx: typer.Context,
     session_id: int = typer.Option(..., "--session-id"),
     line_id: int = typer.Option(..., "--line-id"),
-    entry_id: int = typer.Option(..., "--entry-id"),
+    journal_line_id: int = typer.Option(..., "--journal-line-id"),
+    amount: str = typer.Option(..., "--amount"),
     dry_run: bool = typer.Option(False, "--dry-run"),
 ) -> None:
     _run_session_command(
         ctx,
         "reconcile match",
-        lambda session: match_reconciliation(session, session_id=session_id, line_id=line_id, entry_id=entry_id),
+        lambda session: match_reconciliation(
+            session,
+            session_id=session_id,
+            line_id=line_id,
+            journal_line_id=journal_line_id,
+            amount=amount,
+        ),
         dry_run=dry_run,
+    )
+
+
+@reconcile_app.command("candidates")
+def reconcile_candidates_command(
+    ctx: typer.Context,
+    session_id: int = typer.Option(..., "--session-id"),
+) -> None:
+    _run_session_command(
+        ctx,
+        "reconcile candidates",
+        lambda session: reconciliation_candidates(session, session_id=session_id),
     )
 
 
@@ -556,6 +615,36 @@ def reconcile_close(
     )
 
 
+@reconcile_app.command("reopen")
+def reconcile_reopen(
+    ctx: typer.Context,
+    session_id: int = typer.Option(..., "--session-id"),
+    reason: str = typer.Option(..., "--reason"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    _run_session_command(
+        ctx,
+        "reconcile reopen",
+        lambda session: reopen_reconciliation(session, session_id=session_id, reason=reason),
+        dry_run=dry_run,
+    )
+
+
+@reconcile_app.command("void")
+def reconcile_void(
+    ctx: typer.Context,
+    session_id: int = typer.Option(..., "--session-id"),
+    reason: str = typer.Option(..., "--reason"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    _run_session_command(
+        ctx,
+        "reconcile void",
+        lambda session: void_reconciliation(session, session_id=session_id, reason=reason),
+        dry_run=dry_run,
+    )
+
+
 @reconcile_app.command("list")
 def reconcile_list(ctx: typer.Context) -> None:
     _run_session_command(
@@ -568,11 +657,283 @@ def reconcile_list(ctx: typer.Context) -> None:
                     "account_id": item.account_id,
                     "statement_start": item.statement_start,
                     "statement_end": item.statement_end,
+                    "statement_starting_balance_cents": item.statement_starting_balance_cents,
+                    "statement_ending_balance_cents": item.statement_ending_balance_cents,
                     "status": item.status,
                 }
                 for item in list_reconciliation_sessions(session)
             ]
         },
+    )
+
+
+@document_app.command("add")
+def document_add(
+    ctx: typer.Context,
+    source_path: Path = typer.Option(..., "--source-path"),
+    document_type: str = typer.Option(..., "--type"),
+    year: int = typer.Option(..., "--year"),
+    scope: str = typer.Option("business", "--scope"),
+    period_start: str | None = typer.Option(None, "--period-start"),
+    period_end: str | None = typer.Option(None, "--period-end"),
+    notes: str | None = typer.Option(None, "--notes"),
+    journal_entry_id: int | None = typer.Option(None, "--journal-entry-id"),
+    reconciliation_session_id: int | None = typer.Option(None, "--reconciliation-session-id"),
+    tax_obligation_code: str | None = typer.Option(None, "--tax-obligation-code"),
+    import_run_id: int | None = typer.Option(None, "--import-run-id"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    state: CLIState = ctx.obj
+    _run_session_command(
+        ctx,
+        "document add",
+        lambda session: {
+            "document": serialize_document(
+                create_document(
+                    session,
+                    ledger_dir=state.ledger_dir,
+                    source_path=source_path,
+                    document_type=document_type,
+                    tax_year=year,
+                    scope=scope,
+                    period_start=parse_date(period_start),
+                    period_end=parse_date(period_end),
+                    notes=notes,
+                    dry_run=dry_run,
+                    journal_entry_id=journal_entry_id,
+                    reconciliation_session_id=reconciliation_session_id,
+                    tax_obligation_code=tax_obligation_code,
+                    import_run_id=import_run_id,
+                )
+            )
+        },
+        dry_run=dry_run,
+    )
+
+
+@document_app.command("list")
+def document_list_command(
+    ctx: typer.Context,
+    year: int | None = typer.Option(None, "--year"),
+    document_type: str | None = typer.Option(None, "--type"),
+    scope: str | None = typer.Option(None, "--scope"),
+    journal_entry_id: int | None = typer.Option(None, "--journal-entry-id"),
+    reconciliation_session_id: int | None = typer.Option(None, "--reconciliation-session-id"),
+    tax_obligation_code: str | None = typer.Option(None, "--tax-obligation-code"),
+    import_run_id: int | None = typer.Option(None, "--import-run-id"),
+) -> None:
+    _run_session_command(
+        ctx,
+        "document list",
+        lambda session: {
+            "rows": [
+                {key: value for key, value in serialize_document(document).items() if key != "links"}
+                for document in list_documents(
+                    session,
+                    tax_year=year,
+                    document_type=document_type,
+                    scope=scope,
+                    journal_entry_id=journal_entry_id,
+                    reconciliation_session_id=reconciliation_session_id,
+                    tax_obligation_code=tax_obligation_code,
+                    import_run_id=import_run_id,
+                )
+            ]
+        },
+    )
+
+
+@document_app.command("update")
+def document_update_command(
+    ctx: typer.Context,
+    document_id: int = typer.Option(..., "--document-id"),
+    document_type: str | None = typer.Option(None, "--type"),
+    year: int | None = typer.Option(None, "--year"),
+    scope: str | None = typer.Option(None, "--scope"),
+    period_start: str | None = typer.Option(None, "--period-start"),
+    period_end: str | None = typer.Option(None, "--period-end"),
+    notes: str | None = typer.Option(None, "--notes"),
+    clear_period: bool = typer.Option(False, "--clear-period"),
+    clear_notes: bool = typer.Option(False, "--clear-notes"),
+    clear_links: bool = typer.Option(False, "--clear-links"),
+    journal_entry_id: int | None = typer.Option(None, "--journal-entry-id"),
+    reconciliation_session_id: int | None = typer.Option(None, "--reconciliation-session-id"),
+    tax_obligation_code: str | None = typer.Option(None, "--tax-obligation-code"),
+    import_run_id: int | None = typer.Option(None, "--import-run-id"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    parsed_period_start = UNSET if period_start is None else parse_date(period_start)
+    parsed_period_end = UNSET if period_end is None else parse_date(period_end)
+    parsed_notes = UNSET if notes is None else notes
+    _run_session_command(
+        ctx,
+        "document update",
+        lambda session: {
+            "document": serialize_document(
+                update_document(
+                    session,
+                    document_id=document_id,
+                    document_type=document_type,
+                    tax_year=year,
+                    scope=scope,
+                    period_start=parsed_period_start,
+                    period_end=parsed_period_end,
+                    notes=parsed_notes,
+                    clear_period=clear_period,
+                    clear_notes=clear_notes,
+                    clear_links=clear_links,
+                    journal_entry_id=journal_entry_id,
+                    reconciliation_session_id=reconciliation_session_id,
+                    tax_obligation_code=tax_obligation_code,
+                    import_run_id=import_run_id,
+                )
+            )
+        },
+        dry_run=dry_run,
+    )
+
+
+@document_app.command("checklist")
+def document_checklist_command(ctx: typer.Context, year: int = typer.Option(..., "--year")) -> None:
+    state: CLIState = ctx.obj
+    _run_session_command(
+        ctx,
+        "document checklist",
+        lambda session: document_checklist(session, ledger_dir=state.ledger_dir, year=year),
+    )
+
+
+@settlement_app.command("list")
+def settlement_list_command(ctx: typer.Context) -> None:
+    _run_session_command(
+        ctx,
+        "settlement list",
+        lambda session: list_settlements(session),
+    )
+
+
+@settlement_app.command("apply")
+def settlement_apply_command(
+    ctx: typer.Context,
+    source_line_id: int = typer.Option(..., "--source-line-id"),
+    settlement_line_id: int = typer.Option(..., "--settlement-line-id"),
+    amount: str = typer.Option(..., "--amount"),
+    applied_date: str | None = typer.Option(None, "--applied-date"),
+    application_type: str = typer.Option("manual", "--application-type"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    _run_session_command(
+        ctx,
+        "settlement apply",
+        lambda session: apply_settlement(
+            session,
+            source_line_id=source_line_id,
+            settlement_line_id=settlement_line_id,
+            amount=amount,
+            applied_date=parse_date(applied_date),
+            application_type=application_type,
+        ),
+        dry_run=dry_run,
+    )
+
+
+@settlement_app.command("reverse")
+def settlement_reverse_command(
+    ctx: typer.Context,
+    settlement_application_id: int = typer.Option(..., "--settlement-application-id"),
+    reason: str = typer.Option(..., "--reason"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    _run_session_command(
+        ctx,
+        "settlement reverse",
+        lambda session: reverse_settlement(session, settlement_application_id=settlement_application_id, reason=reason),
+        dry_run=dry_run,
+    )
+
+
+@review_app.command("list")
+def review_list_command(ctx: typer.Context, status: str | None = typer.Option(None, "--status")) -> None:
+    _run_session_command(
+        ctx,
+        "review list",
+        lambda session: list_review_blockers(session, status=status),
+    )
+
+
+@review_app.command("resolve")
+def review_resolve_command(
+    ctx: typer.Context,
+    blocker_id: int = typer.Option(..., "--blocker-id"),
+    resolution_type: str = typer.Option(..., "--resolution-type"),
+    note: str | None = typer.Option(None, "--note"),
+    override_tax_cents: int | None = typer.Option(None, "--override-tax-cents"),
+    manual_entry_id: int | None = typer.Option(None, "--manual-entry-id"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    state: CLIState = ctx.obj
+    config = load_config(state.ledger_dir)
+    _run_session_command(
+        ctx,
+        "review resolve",
+        lambda session: resolve_review_blocker(
+            session,
+            blocker_id=blocker_id,
+            resolution_type=resolution_type,
+            note=note,
+            override_tax_cents=override_tax_cents,
+            manual_entry_id=manual_entry_id,
+            config=config,
+        ),
+        dry_run=dry_run,
+    )
+
+
+@review_app.command("retry")
+def review_retry_command(
+    ctx: typer.Context,
+    blocker_id: int = typer.Option(..., "--blocker-id"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    state: CLIState = ctx.obj
+    config = load_config(state.ledger_dir)
+    _run_session_command(
+        ctx,
+        "review retry",
+        lambda session: retry_review_blocker(session, blocker_id=blocker_id, config=config),
+        dry_run=dry_run,
+    )
+
+
+@profile_app.command("show")
+def compliance_profile_show(ctx: typer.Context) -> None:
+    _run_session_command(
+        ctx,
+        "compliance profile show",
+        lambda session: {"profile": get_compliance_profile(session).model_dump()},
+    )
+
+
+@profile_app.command("update")
+def compliance_profile_update(
+    ctx: typer.Context,
+    from_file: Path | None = typer.Option(None, "--from-file"),
+    json_value: str | None = typer.Option(None, "--json"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    if from_file is None and json_value is None:
+        raise ValidationError("Provide either --from-file or --json")
+    raw: dict[str, Any]
+    if from_file is not None:
+        raw = json.loads(from_file.read_text(encoding="utf-8"))
+    else:
+        raw = json.loads(json_value or "{}")
+    profile = ComplianceProfile.model_validate(raw)
+    _run_session_command(
+        ctx,
+        "compliance profile update",
+        lambda session: {"profile": set_compliance_profile(session, profile).model_dump()},
+        dry_run=dry_run,
     )
 
 
@@ -588,11 +949,15 @@ def report_pnl(
     _run_session_command(
         ctx,
         "report pnl",
-        lambda session: pnl(
-            session,
-            period_start=parse_date(period_start),
-            period_end=parse_date(period_end),
-            basis=basis or config.default_report_basis,
+        lambda session: (
+            lambda payload: (payload, list(payload.get("warnings", [])))
+        )(
+            pnl(
+                session,
+                period_start=parse_date(period_start),
+                period_end=parse_date(period_end),
+                basis=basis or config.default_report_basis,
+            )
         ),
     )
 
@@ -600,11 +965,10 @@ def report_pnl(
 @report_app.command("balance-sheet")
 def report_balance_sheet(ctx: typer.Context, as_of: str | None = typer.Option(None, "--as-of")) -> None:
     state: CLIState = ctx.obj
-    config = load_config(state.ledger_dir)
     _run_session_command(
         ctx,
         "report balance-sheet",
-        lambda session: balance_sheet(session, as_of=_require_as_of(state, as_of), basis=config.default_report_basis),
+        lambda session: balance_sheet(session, as_of=_require_as_of(state, as_of)),
     )
 
 
@@ -626,11 +990,17 @@ def report_general_ledger(
     ctx: typer.Context,
     period_start: str = typer.Option(..., "--period-start"),
     period_end: str = typer.Option(..., "--period-end"),
+    include_line_ids: bool = typer.Option(True, "--include-line-ids/--no-include-line-ids"),
 ) -> None:
     _run_session_command(
         ctx,
         "report general-ledger",
-        lambda session: general_ledger(session, period_start=parse_date(period_start), period_end=parse_date(period_end)),
+        lambda session: general_ledger(
+            session,
+            period_start=parse_date(period_start),
+            period_end=parse_date(period_end),
+            include_line_ids=include_line_ids,
+        ),
     )
 
 
@@ -771,4 +1141,15 @@ def export_year_end_command(ctx: typer.Context, year: int = typer.Option(..., "-
         ctx,
         "export year-end",
         lambda session: export_year_end(session, ledger_dir=state.ledger_dir, config=config, year=year),
+    )
+
+
+@export_app.command("accountant-packet")
+def export_accountant_packet_command(ctx: typer.Context, year: int = typer.Option(..., "--year")) -> None:
+    state: CLIState = ctx.obj
+    config = load_config(state.ledger_dir)
+    _run_session_command(
+        ctx,
+        "export accountant-packet",
+        lambda session: export_accountant_packet(session, ledger_dir=state.ledger_dir, config=config, year=year),
     )

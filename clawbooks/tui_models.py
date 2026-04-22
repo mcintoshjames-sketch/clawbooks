@@ -49,6 +49,7 @@ class ReportView:
 @dataclass(slots=True, frozen=True)
 class StatusView:
     as_of: date
+    packet_year: int
     sections: list[TableSection] = field(default_factory=list)
 
 
@@ -57,6 +58,7 @@ class ExportResult:
     title: str
     output_dir: Path
     files: list[str] = field(default_factory=list)
+    zip_path: Path | None = None
 
 
 @dataclass(slots=True, frozen=True)

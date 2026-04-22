@@ -239,19 +239,39 @@ class StatusPane(Static):
         super().__init__(id=id)
         self.facade = facade
         self.view: StatusView | None = None
+        self.packet_year = date.today().year
 
     def on_mount(self) -> None:
-        self.view = self.facade.status()
+        self.load_status()
+
+    def load_status(self) -> None:
+        self.view = self.facade.status(packet_year=self.packet_year)
         self.refresh(recompose=True)
 
     def compose(self) -> ComposeResult:
         if not self.view:
             yield Static("Loading status...", classes="empty-state")
             return
-        yield Static(f"[bold]Status[/bold]\nAs of: {self.view.as_of.isoformat()}", classes="view-title")
+        yield Static(
+            f"[bold]Status[/bold]\nAs of: {self.view.as_of.isoformat()}\nPacket year: {self.view.packet_year}",
+            classes="view-title",
+        )
+        with Horizontal(id="status-toolbar"):
+            yield Input(value=str(self.packet_year), placeholder="YYYY", id="status-year")
+            yield Button("Reload", id="reload-status")
         with VerticalScroll(id="status-scroll"):
             for index, section in enumerate(self.view.sections):
                 yield SectionTableWidget(section, id=f"status-section-{index}")
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id != "reload-status":
+            return
+        raw_year = self.query_one("#status-year", Input).value
+        if not raw_year.isdigit():
+            self.app.notify("Packet year must be numeric.", title="Invalid year", severity="error")
+            return
+        self.packet_year = int(raw_year)
+        self.load_status()
 
 
 class ExportPane(Static):
@@ -261,22 +281,43 @@ class ExportPane(Static):
         self.pending_export: tuple[str, dict[str, object]] | None = None
         self.result: ExportResult | None = None
         self.error_text = ""
+        self.document_notice = ""
 
     def compose(self) -> ComposeResult:
         month_start = date.today().replace(day=1).isoformat()
         today = date.today().isoformat()
         year = str(date.today().year)
-        yield Static("[bold]Exports[/bold]\nExports are the only write actions available in the TUI.", classes="view-title")
-        with Horizontal(id="exports-layout"):
-            with Vertical(classes="export-card"):
-                yield Label("Period-End Export", classes="section-title")
-                yield Input(value=month_start, placeholder="YYYY-MM-DD", id="export-period-start")
-                yield Input(value=today, placeholder="YYYY-MM-DD", id="export-period-end")
-                yield Button("Prepare Period-End Export", id="prepare-period-export")
-            with Vertical(classes="export-card"):
-                yield Label("Year-End Export", classes="section-title")
-                yield Input(value=year, placeholder="YYYY", id="export-year")
-                yield Button("Prepare Year-End Export", id="prepare-year-export")
+        yield Static("[bold]Exports[/bold]\nUse this pane to add supporting documents and generate accountant-ready export bundles.", classes="view-title")
+        with VerticalScroll(id="exports-scroll"):
+            with Horizontal(id="exports-layout"):
+                with Vertical(classes="export-card"):
+                    yield Label("Manual Document Intake", classes="section-title")
+                    yield Static(
+                        "Examples: stripe_1099_k, estimated_tax_confirmation, prior_year_return, tax_notice",
+                        classes="form-note",
+                    )
+                    yield Input(placeholder="/path/to/file.pdf", id="document-source-path")
+                    yield Input(value="stripe_1099_k", placeholder="document type", id="document-type")
+                    yield Input(value=year, placeholder="YYYY", id="document-year")
+                    yield Input(value="business", placeholder="business or owner", id="document-scope")
+                    yield Input(placeholder="YYYY-MM-DD", id="document-period-start")
+                    yield Input(placeholder="YYYY-MM-DD", id="document-period-end")
+                    yield Input(placeholder="Notes", id="document-notes")
+                    yield Button("Add Document", id="add-document")
+                with Vertical(classes="export-card"):
+                    yield Label("Accountant Packet Export", classes="section-title")
+                    yield Input(value=year, placeholder="YYYY", id="export-packet-year")
+                    yield Button("Prepare Accountant Packet", id="prepare-accountant-packet-export")
+            with Horizontal(id="exports-secondary"):
+                with Vertical(classes="export-card"):
+                    yield Label("Period-End Export", classes="section-title")
+                    yield Input(value=month_start, placeholder="YYYY-MM-DD", id="export-period-start")
+                    yield Input(value=today, placeholder="YYYY-MM-DD", id="export-period-end")
+                    yield Button("Prepare Period-End Export", id="prepare-period-export")
+                with Vertical(classes="export-card"):
+                    yield Label("Year-End Export", classes="section-title")
+                    yield Input(value=year, placeholder="YYYY", id="export-year")
+                    yield Button("Prepare Year-End Export", id="prepare-year-export")
         if self.pending_export:
             kind, values = self.pending_export
             summary = (
@@ -289,8 +330,12 @@ class ExportPane(Static):
                 yield Button("Cancel", id="cancel-export")
         if self.error_text:
             yield Static(self.error_text, classes="dashboard-alert")
+        if self.document_notice:
+            yield Static(self.document_notice, id="document-notice")
         if self.result:
             yield Static(f"Output: {self.result.output_dir}", id="export-output-dir")
+            if self.result.zip_path:
+                yield Static(f"Zip: {self.result.zip_path}", id="export-zip-path")
             yield SectionTableWidget(
                 TableSection(
                     title=self.result.title,
@@ -304,6 +349,30 @@ class ExportPane(Static):
     def on_button_pressed(self, event: Button.Pressed) -> None:
         button_id = event.button.id or ""
         self.error_text = ""
+        if button_id == "add-document":
+            raw_year = self.query_one("#document-year", Input).value
+            if not raw_year.isdigit():
+                self.error_text = "Document year must be numeric."
+                self.refresh(recompose=True)
+                return
+            try:
+                document = self.facade.add_document(
+                    source_path=Path(self.query_one("#document-source-path", Input).value).expanduser(),
+                    document_type=self.query_one("#document-type", Input).value.strip(),
+                    year=int(raw_year),
+                    scope=self.query_one("#document-scope", Input).value.strip() or "business",
+                    period_start=parse_date(self.query_one("#document-period-start", Input).value or None),
+                    period_end=parse_date(self.query_one("#document-period-end", Input).value or None),
+                    notes=self.query_one("#document-notes", Input).value or None,
+                )
+            except ValidationError as exc:
+                self.error_text = exc.message
+                self.refresh(recompose=True)
+                return
+            self.document_notice = f"Added document {document['document_id']}: {document['original_filename']}"
+            self.app.notify(self.document_notice, title="Document added")
+            self.refresh(recompose=True)
+            return
         if button_id == "prepare-period-export":
             try:
                 start = parse_date(self.query_one("#export-period-start", Input).value)
@@ -326,6 +395,16 @@ class ExportPane(Static):
             self.pending_export = ("year_end", {"year": raw_year})
             self.refresh(recompose=True)
             return
+        if button_id == "prepare-accountant-packet-export":
+            raw_year = self.query_one("#export-packet-year", Input).value
+            if not raw_year.isdigit():
+                self.error_text = "Packet year must be numeric."
+                self.refresh(recompose=True)
+                return
+            self.result = None
+            self.pending_export = ("accountant_packet", {"year": raw_year})
+            self.refresh(recompose=True)
+            return
         if button_id == "cancel-export":
             self.pending_export = None
             self.refresh(recompose=True)
@@ -337,8 +416,10 @@ class ExportPane(Static):
                     start=parse_date(values["period_start"]),
                     end=parse_date(values["period_end"]),
                 )
-            else:
+            elif kind == "year_end":
                 result = self.facade.export_year_end(year=int(values["year"]))
+            else:
+                result = self.facade.export_accountant_packet(year=int(values["year"]))
             self.pending_export = None
             self.result = result
             self.refresh(recompose=True)
@@ -351,7 +432,7 @@ class HelpPane(Static):
         self.commands = commands
 
     def compose(self) -> ComposeResult:
-        parts = ["# CLI Handoff\n", "These workflows remain CLI-only in the first TUI phase.\n"]
+        parts = ["# CLI Handoff\n", "These workflows remain CLI-first even though packet exports and document intake are available in the TUI.\n"]
         for command in self.commands:
             parts.append(f"## {command.title}\n")
             parts.append(f"{command.description}\n")
@@ -461,7 +542,9 @@ class ClawbooksTuiApp(App[None]):
     .section-scroll,
     #reports-layout,
     #report-main,
-    #exports-layout {
+    #exports-layout,
+    #exports-secondary,
+    #exports-scroll {
         height: 1fr;
     }
 
@@ -529,13 +612,19 @@ class ClawbooksTuiApp(App[None]):
 
     #range-toolbar,
     #asof-toolbar,
-    #export-confirm-buttons {
+    #export-confirm-buttons,
+    #status-toolbar {
         height: auto;
         padding: 0 1 1 1;
     }
 
     Input {
         margin-right: 1;
+    }
+
+    .form-note {
+        padding: 0 0 1 0;
+        color: $text-muted;
     }
 
     .export-card {
@@ -546,7 +635,9 @@ class ClawbooksTuiApp(App[None]):
     }
 
     #export-confirmation,
-    #export-output-dir {
+    #export-output-dir,
+    #export-zip-path,
+    #document-notice {
         padding: 1;
     }
 

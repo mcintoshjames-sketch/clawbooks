@@ -1,73 +1,64 @@
 # OpenClaw Agent Guide for `clawbooks`
 
-This guide tells an AI agent how to operate `clawbooks` safely as the bookkeeping tool for a single-member Illinois LLC with Stripe subscription revenue.
+This guide defines how an AI operator should use `clawbooks` safely.
 
 ## Mission
 
-Use `clawbooks` to keep clean books, maintain reconciliation discipline, surface tax-review issues, and prepare period-end and year-end exports for the owner and CPA.
+Maintain clean books, explicit reconciliation evidence, explicit cash-basis settlement support, and an advisory accountant packet for a single-member LLC with Stripe subscription revenue.
 
-Do not act as a tax lawyer, payroll engine, or filing authority. Use the app to record facts, track liabilities, and produce exports. Escalate legal, nexus, payroll, or filing judgment calls to a human or CPA.
+Do not treat `clawbooks` as:
+- a tax-law engine
+- a filing engine
+- a payroll engine
+- a nexus determination tool
 
 ## Non-Negotiable Rules
 
-1. Use the CLI only. Do not write directly to `ledger.db`, edit exported files, or mutate the ledger outside `clawbooks`.
-2. Prefer `--json` on every read and every automation-facing command.
-3. Use `--dry-run` first on imports and risky writes when facts are incomplete.
-4. Never delete or overwrite accounting history. Use `journal reverse` or a compensating entry.
-5. Never acknowledge a tax-review warning without explicit human approval.
-6. Never close a period unless reconciliation is complete and tax-review warnings are resolved or explicitly approved.
-7. Never guess taxability for a transaction stream. Record facts and escalate if Stripe tax detail is missing or ambiguous.
-8. Never book owner personal spending as payroll. Use owner contribution or reimbursement logic only.
-9. If a command returns a nonzero exit code, stop and resolve it before continuing downstream workflow.
+1. Use the CLI only for bookkeeping actions. Do not edit `ledger.db` directly.
+2. Prefer `--json` for every agent-facing command.
+3. Use `--dry-run` on imports and risky writes first.
+4. Never mutate history in place. Use reversal commands, compensating entries, settlement reversal, or reconciliation reopen flows.
+5. Never guess tax effect for ambiguous Stripe events.
+6. Never close a period with open review blockers.
+7. Never assume checklist `unknown` means not applicable.
+8. Never map a bank-side Stripe payout to `4000`. Stripe payouts should clear `1010`, not create revenue.
+9. Balance sheet is accrual-only. Do not describe it as cash-basis.
 
-## Environment and Startup
+## Core Commands
 
-Use one ledger directory per business.
-
-Required startup assumptions:
-- Business is a single-member LLC.
-- Base currency is `USD`.
-- Timezone is `America/Chicago`.
-- Stripe is the revenue source in v1.
-- Stripe Tax is the expected tax collection engine when enabled.
-
-Recommended startup pattern:
-
-```bash
-uv run clawbooks --ledger /absolute/path/to/ledger --json init --business-name "Example LLC"
-```
-
-If importing Stripe, set:
-
-```bash
-export CLAWBOOKS_STRIPE_API_KEY=sk_live_...
-```
-
-## Core Command Pattern
-
-Always prefer this shell shape:
+Always use:
 
 ```bash
 uv run clawbooks --ledger /absolute/path/to/ledger --json <command> ...
 ```
 
-Result contract:
-
-```json
-{"ok":true,"command":"report pnl","data":{},"warnings":[],"errors":[]}
-```
-
 Exit codes:
 - `0`: success
-- `2`: validation or input error
-- `3`: reconciliation mismatch
+- `2`: validation/input error
+- `3`: reconciliation error
 - `4`: locked period
-- `5`: import conflict or duplicate external event problem
-- `6`: compliance prerequisite missing, including tax-review blockers
+- `5`: import conflict
+- `6`: compliance prerequisite missing, including open review blockers
 
-## Default Account Codes
+## Startup
 
-Use these defaults unless the ledger has been customized:
+```bash
+uv run clawbooks --ledger /ledger --json init --business-name "Example LLC"
+```
+
+If importing Stripe:
+
+```bash
+export CLAWBOOKS_STRIPE_API_KEY=sk_live_...
+```
+
+Default assumptions:
+- `USD`
+- timezone `America/Chicago`
+- Stripe subscriptions are the only revenue stream in v1
+- checklist and tax outputs are advisory
+
+## Core Accounts
 
 - `1000`: Business Checking
 - `1010`: Stripe Clearing
@@ -81,20 +72,16 @@ Use these defaults unless the ledger has been customized:
 - `4000`: Subscription Revenue
 - `4010`: Refunds and Discounts
 - `5000`: Stripe Fees
-- `5100`: Software and SaaS
 - `5110`: Hosting
 - `5120`: Professional Fees
-- `5130`: Bank Fees
 - `5140`: Taxes and Licenses
 - `5150`: Contractors
 - `5160`: Chargebacks
 - `5199`: Uncategorized Expense
 
-## Daily Operating Playbooks
+## Manual Expenses
 
-### 1. Record a manual expense
-
-For a business-paid expense:
+Business-paid:
 
 ```bash
 uv run clawbooks --ledger /ledger --json expense record \
@@ -105,7 +92,7 @@ uv run clawbooks --ledger /ledger --json expense record \
   --payment-account 1000
 ```
 
-For an owner-paid expense that should be treated as contributed capital:
+Owner-paid, non-reimbursable:
 
 ```bash
 uv run clawbooks --ledger /ledger --json expense record \
@@ -116,7 +103,7 @@ uv run clawbooks --ledger /ledger --json expense record \
   --paid-personally
 ```
 
-For an owner-paid expense that should be reimbursed later:
+Owner-paid, reimbursable later:
 
 ```bash
 uv run clawbooks --ledger /ledger --json expense record \
@@ -129,13 +116,14 @@ uv run clawbooks --ledger /ledger --json expense record \
 ```
 
 Rules:
-- Require an explicit category code.
-- Require an explicit payment account unless `--paid-personally` is used.
-- Use `--receipt-path` when supporting evidence exists.
+- always choose an explicit category
+- use `--receipt-path` when source evidence exists
+- use `3000` only for owner-paid, non-reimbursable expense flow
+- use `2300` only when reimbursement is expected later
 
-### 2. Import Stripe activity
+## Stripe Import
 
-Preview first:
+Preview:
 
 ```bash
 uv run clawbooks --ledger /ledger --json import stripe \
@@ -144,7 +132,7 @@ uv run clawbooks --ledger /ledger --json import stripe \
   --dry-run
 ```
 
-Then commit:
+Commit:
 
 ```bash
 uv run clawbooks --ledger /ledger --json import stripe \
@@ -152,20 +140,34 @@ uv run clawbooks --ledger /ledger --json import stripe \
   --to-date 2026-04-30
 ```
 
-Interpretation rules:
-- `charge` events should post gross cash to Stripe clearing, revenue to `4000`, and tax collected to `2100` when present.
-- Stripe fees should post to `5000`.
-- Refunds should post to `4010` and reduce Stripe clearing.
-- Disputes should post to `5160`.
-- Payouts should move value from `1010` to `1000`.
+Posting policy:
+- taxable charge: debit `1010`, credit `4000`, credit `2100` for collected tax
+- Stripe fee: debit `5000`, credit `1010`
+- payout: debit `1000`, credit `1010`
+- ambiguous refund/dispute/tax cases: do not post; create a review blocker instead
 
-Tax rules:
-- If the import returns warnings about missing tax detail, treat them as compliance blockers until human review.
-- Do not “fix” missing tax detail by manually inventing a sales-tax amount.
+Blocked event workflow:
 
-### 3. Import a bank or card CSV
+```bash
+uv run clawbooks --ledger /ledger --json review list --status open
+uv run clawbooks --ledger /ledger --json review resolve \
+  --blocker-id 12 \
+  --resolution-type skip \
+  --note "Handled offline"
+```
 
-Use a mapping profile JSON file:
+Override posting is allowed only with explicit human review:
+
+```bash
+uv run clawbooks --ledger /ledger --json review resolve \
+  --blocker-id 12 \
+  --resolution-type post_with_override \
+  --override-tax-cents 0
+```
+
+## CSV Import
+
+Profile example:
 
 ```json
 {
@@ -174,78 +176,80 @@ Use a mapping profile JSON file:
   "amount_column": "amount",
   "external_ref_column": "external_ref",
   "rules": [
-    {"match": "AWS", "account_code": "5110", "entry_kind": "expense"},
-    {"match": "Stripe Payout", "account_code": "4000", "entry_kind": "income"}
+    {"match": "AWS", "account_code": "5110", "entry_kind": "expense"}
   ]
 }
 ```
 
-Preview first:
+Preview:
 
 ```bash
 uv run clawbooks --ledger /ledger --json import csv \
   --account-code 1000 \
   --csv-path /path/to/statement.csv \
   --profile-path /path/to/profile.json \
-  --statement-ending-balance 1500.25 \
+  --statement-starting-balance 1000.00 \
+  --statement-ending-balance 915.88 \
   --dry-run
 ```
 
-Then commit:
+Commit:
 
 ```bash
 uv run clawbooks --ledger /ledger --json import csv \
   --account-code 1000 \
   --csv-path /path/to/statement.csv \
   --profile-path /path/to/profile.json \
-  --statement-ending-balance 1500.25
+  --statement-starting-balance 1000.00 \
+  --statement-ending-balance 915.88
 ```
 
 Rules:
-- Explicitly mapped rows post journal entries.
-- Unmatched rows become draft reconciliation lines and must be reviewed.
-- Do not auto-classify unmatched rows by guesswork.
+- dedupe is transaction-based, not file-path based
+- unmatched rows stay unresolved; do not guess
+- if you want reconciliation created during import, provide both starting and ending balances
 
-### 4. Add or reverse a journal entry
+## Settlement Workflow
 
-Use `journal add` only for explicit adjustments the human or CPA has approved.
+Cash-basis `P&L` only includes:
+- immediate-cash activity posted directly against `bank`, `stripe_clearing`, or `card`
+- owner-paid non-reimbursable expenses using `3000`
+- accrual activity that is explicitly settled
+
+When a manual accrual entry exists, settle it explicitly:
 
 ```bash
-uv run clawbooks --ledger /ledger --json journal add \
-  --date 2026-04-30 \
-  --description "CPA adjustment" \
-  --line 5120:200.00:"Professional fees" \
-  --line 2000:-200.00:"Credit card payable"
+uv run clawbooks --ledger /ledger --json settlement apply \
+  --source-line-id 10 \
+  --settlement-line-id 42 \
+  --amount 100.00
 ```
 
-For non-cash entries:
+Inspect current applications:
 
 ```bash
-uv run clawbooks --ledger /ledger --json journal add \
-  --date 2026-04-30 \
-  --description "Accrual adjustment" \
-  --line 1100:100.00:"Accounts receivable" \
-  --line 4000:-100.00:"Revenue" \
-  --non-cash
+uv run clawbooks --ledger /ledger --json settlement list
 ```
 
-To reverse:
+Reverse a bad settlement:
 
 ```bash
-uv run clawbooks --ledger /ledger --json journal reverse \
-  --entry-id 42 \
-  --date 2026-05-01 \
-  --reason "Duplicate posting"
+uv run clawbooks --ledger /ledger --json settlement reverse \
+  --settlement-application-id 7 \
+  --reason "Wrong source line"
 ```
 
 Rules:
-- Entries must balance exactly.
-- Prefer reversal over editing history.
-- Use non-cash entries sparingly and only with explicit justification.
+- `source_line_id` must be revenue, expense, or contra-revenue
+- `settlement_line_id` must be a supported cash-equivalent or `3000`
+- `settlement_line_id` cannot come from an entry that is already immediate-cash `P&L`
+- never over-apply either side
+- do not add or reverse settlement applications inside a closed period; reopen the period first
+- do not reverse a settled journal entry until the settlement application is reversed
 
 ## Reconciliation Workflow
 
-### Start reconciliation
+Start:
 
 ```bash
 uv run clawbooks --ledger /ledger --json reconcile start \
@@ -253,102 +257,74 @@ uv run clawbooks --ledger /ledger --json reconcile start \
   --statement-path /path/to/statement.csv \
   --statement-start 2026-04-01 \
   --statement-end 2026-04-30 \
-  --statement-ending-balance 1500.25
+  --statement-starting-balance 1000.00 \
+  --statement-ending-balance 915.88
 ```
 
-### Match a draft line to an entry
+Discover candidate journal lines:
+
+```bash
+uv run clawbooks --ledger /ledger --json reconcile candidates --session-id 7
+```
+
+Apply matches by amount:
 
 ```bash
 uv run clawbooks --ledger /ledger --json reconcile match \
   --session-id 7 \
   --line-id 12 \
-  --entry-id 44
+  --journal-line-id 44 \
+  --amount 60.00
 ```
 
-### Close reconciliation
+Close:
 
 ```bash
 uv run clawbooks --ledger /ledger --json reconcile close --session-id 7
 ```
 
-Rules:
-- Every financial account active in the period must be reconciled before period close.
-- A reconciliation cannot close with unresolved draft lines.
-- If `reconcile close` returns exit code `3`, resolve the mismatch before moving on.
-
-## Month-End Close Workflow
-
-Run this sequence in order:
-
-1. Import Stripe for the full month with a dry run, then a real run.
-2. Import bank and card statements with dry runs, then real runs.
-3. Review unmatched CSV rows and resolve them.
-4. Start and close reconciliations for `1000`, `1010`, and any active card account.
-5. Review reports:
-   - `report pnl`
-   - `report balance-sheet`
-   - `report tax-liabilities`
-   - `report owner-equity`
-6. Review all Stripe or tax warnings from prior commands.
-7. If a tax-review warning exists, get human approval before acknowledging it during close.
-8. Close the period.
-9. Export the period-end package.
-
-Recommended commands:
+Reopen:
 
 ```bash
-uv run clawbooks --ledger /ledger --json report pnl --period-start 2026-04-01 --period-end 2026-04-30
-uv run clawbooks --ledger /ledger --json report balance-sheet --as-of 2026-04-30
-uv run clawbooks --ledger /ledger --json report tax-liabilities --as-of 2026-04-30
-uv run clawbooks --ledger /ledger --json period close --period-start 2026-04-01 --period-end 2026-04-30
-uv run clawbooks --ledger /ledger --json export period-end --period-start 2026-04-01 --period-end 2026-04-30
+uv run clawbooks --ledger /ledger --json reconcile reopen \
+  --session-id 7 \
+  --reason "Need to rematch batched deposit"
 ```
 
-If human approval exists for a specific review-required entry:
+Void a mistaken open session instead of replacing it in place:
 
 ```bash
-uv run clawbooks --ledger /ledger --json period close \
+uv run clawbooks --ledger /ledger --json reconcile void \
+  --session-id 7 \
+  --reason "Wrong statement file"
+```
+
+Rules:
+- matching is line-level, not entry-level
+- partial many-to-one and one-to-many matching is allowed
+- closed sessions are immutable until reopened
+- overlapping non-voided sessions are rejected for the same account
+- once a period is closed, reconciliation start/reopen/void/rematch actions for that statement window are blocked until period reopen
+- candidate discovery may show blocked journal lines with rejection reasons; do not force those through manually
+- outstanding items carry forward through candidate discovery, not fake copied statement rows
+
+## Reporting
+
+Cash-basis `P&L`:
+
+```bash
+uv run clawbooks --ledger /ledger --json report pnl \
+  --period-start 2026-04-01 \
+  --period-end 2026-04-30
+```
+
+Accrual `P&L`:
+
+```bash
+uv run clawbooks --ledger /ledger --json report pnl \
   --period-start 2026-04-01 \
   --period-end 2026-04-30 \
-  --acknowledge-review-entry 44
-```
-
-Do not use `--acknowledge-review-entry` without explicit human authorization.
-
-## Quarter-End and Year-End
-
-At quarter end:
-- Review `tax obligations`.
-- Review `tax rollforward`.
-- Provide exports to the human or CPA.
-
-Commands:
-
-```bash
-uv run clawbooks --ledger /ledger --json tax obligations --as-of 2026-06-30
-uv run clawbooks --ledger /ledger --json tax rollforward --period-start 2026-04-01 --period-end 2026-06-30
-```
-
-At year end:
-
-```bash
-uv run clawbooks --ledger /ledger --json export year-end --year 2026
-```
-
-The year-end export bundle is the handoff package. The agent should not file returns directly from it.
-
-## Reporting Recipes
-
-Profit and loss:
-
-```bash
-uv run clawbooks --ledger /ledger --json report pnl --period-start 2026-04-01 --period-end 2026-04-30
-```
-
-Accrual P&L:
-
-```bash
-uv run clawbooks --ledger /ledger --json report pnl --period-start 2026-04-01 --period-end 2026-04-30 --basis accrual
+  --basis accrual
 ```
 
 Balance sheet:
@@ -357,96 +333,128 @@ Balance sheet:
 uv run clawbooks --ledger /ledger --json report balance-sheet --as-of 2026-04-30
 ```
 
-Cash flow:
+General ledger with line ids:
 
 ```bash
-uv run clawbooks --ledger /ledger --json report cash-flow --period-start 2026-04-01 --period-end 2026-04-30
+uv run clawbooks --ledger /ledger --json report general-ledger \
+  --period-start 2026-04-01 \
+  --period-end 2026-04-30 \
+  --include-line-ids
 ```
 
-General ledger:
+Interpretation rules:
+- if cash-basis `P&L` returns `excluded_lines`, those items were intentionally left out until settlement exists
+- if cash-basis `P&L` returns `ignored_invalid_settlement_applications`, the ledger contained legacy invalid settlement structure and the report suppressed it to avoid double counting
+- do not “fix” excluded cash-basis lines by guessing
+
+## Period Close
+
+Close only after:
+1. imports are complete
+2. financial accounts for the period are reconciled with continuous session coverage across the close window
+3. open review blockers are resolved
 
 ```bash
-uv run clawbooks --ledger /ledger --json report general-ledger --period-start 2026-04-01 --period-end 2026-04-30
+uv run clawbooks --ledger /ledger --json period close \
+  --period-start 2026-04-01 \
+  --period-end 2026-04-30
 ```
 
-Trial balance:
+Reopen if a justified correction is required:
 
 ```bash
-uv run clawbooks --ledger /ledger --json report trial-balance --as-of 2026-04-30
+uv run clawbooks --ledger /ledger --json period reopen \
+  --period-start 2026-04-01 \
+  --period-end 2026-04-30 \
+  --reason "Late adjustment"
 ```
 
-Owner equity:
+Do not treat advisory checklist `unknown` items as close blockers by themselves. Only explicit review blockers should block close.
+
+## Review Retry
+
+Open Stripe blockers can be retried against refreshed upstream facts:
 
 ```bash
-uv run clawbooks --ledger /ledger --json report owner-equity --as-of 2026-04-30
+uv run clawbooks --ledger /ledger --json review retry \
+  --blocker-id 12
 ```
 
-Tax liabilities:
+Rules:
+- retry refreshes the current Stripe facts by external id; it is not limited to the first-seen payload
+- refresh history is preserved for audit trail
+- resolved `skip`, `post_with_override`, and `superseded_by_manual_entry` outcomes remain authoritative on rerun
+
+## Compliance Profile
+
+Checklist applicability depends on the compliance profile, not generic account activity.
+
+Show:
 
 ```bash
-uv run clawbooks --ledger /ledger --json report tax-liabilities --as-of 2026-04-30
+uv run clawbooks --ledger /ledger --json compliance profile show
 ```
 
-## Compliance Decision Boundaries
+Update from a JSON file:
 
-The agent may do these without asking:
-- run reports
-- run dry-run imports
-- post clearly documented operating expenses
-- post approved journal adjustments
-- perform reconciliation matching when evidence is clear
-- export period-end and year-end packages
+```bash
+uv run clawbooks --ledger /ledger --json compliance profile update --from-file /path/to/profile.json
+```
 
-The agent must ask a human before doing these:
-- acknowledging a tax-review warning
-- classifying an ambiguous expense or deposit
-- posting an owner draw vs business expense when intent is unclear
-- adding a new chart-of-accounts account for a policy decision
-- posting non-cash adjustments not directly instructed by a human or CPA
-- reopening a previously closed period
+Example profile:
 
-The agent must escalate to a CPA or human expert for:
-- federal or state tax elections
-- sales-tax nexus and filing jurisdiction decisions
-- payroll setup or payroll tax treatment
-- contractor vs employee classification
-- legal entity restructuring
-- any return filing decision
+```json
+{
+  "entity_tax_classification": "single_member_llc_disregarded",
+  "sales_tax_profile_confirmed": true,
+  "sales_tax_registrations": [
+    {"jurisdiction": "illinois", "filing_cadence": "monthly", "active": true}
+  ],
+  "payroll": {"confirmed": true, "enabled": false, "provider": null, "states": []},
+  "contractor_profile": {"confirmed": false, "requires_1099_nec_documents": null, "handled_by": null},
+  "owner_tracking": {"estimated_tax_confirmations": true}
+}
+```
 
-## Failure Handling
+Rules:
+- if facts are not explicit, checklist items should remain `unknown`
+- do not infer contractor or sales-tax filing duties from raw ledger activity alone
 
-If a command fails:
+## Accountant Packet
 
-- Exit `2`: fix inputs, dates, account codes, or unbalanced entries.
-- Exit `3`: complete reconciliation work or correct the ledger mismatch.
-- Exit `4`: the period is locked. Do not force around it. Ask whether reopen is approved.
-- Exit `5`: inspect duplicate or import-conflict conditions. Do not post around them manually.
-- Exit `6`: resolve tax-review or compliance prerequisites before proceeding.
+Add support docs:
 
-Recommended response pattern:
+```bash
+uv run clawbooks --ledger /ledger --json document add \
+  --source-path /path/to/stripe-1099-k.pdf \
+  --type stripe_1099_k \
+  --year 2026
+```
 
-1. Save the exact failing command and JSON response.
-2. Explain the blocker in plain language.
-3. Offer the smallest safe next step.
-4. Do not continue the workflow until the blocker is cleared.
+Inspect checklist:
 
-## Safe Operating Checklist
+```bash
+uv run clawbooks --ledger /ledger --json document checklist --year 2026
+```
 
-Before each posting/import:
-- confirm the ledger path
-- confirm the date range
-- confirm the account code or category
-- prefer `--dry-run` if the source data is external
+Export advisory handoff packet:
 
-Before each period close:
-- confirm all imports are complete
-- confirm all financial accounts are reconciled
-- confirm no unresolved warnings remain
-- confirm the reports look reasonable
-- confirm human approval for any acknowledged review entries
+```bash
+uv run clawbooks --ledger /ledger --json export accountant-packet --year 2026
+```
 
-## Recommended Agent Prompt Stub
+Packet rules:
+- the packet is advisory, not filing-ready
+- it includes compliance-profile snapshot and unsupported cash-basis warnings
+- `year_end_books_package` is only `present` after the year-end export exists
+- legacy attachments not registered as documents are not included automatically
 
-If OpenClaw needs an operating brief, use something like:
+## Escalate to a Human or CPA
 
-> You are the bookkeeping operator for a single-member Illinois LLC using `clawbooks`. Use the CLI only, prefer `--json`, preserve immutable history, reconcile before close, never acknowledge tax-review warnings without human approval, and escalate taxability, payroll, or filing judgment calls.
+Escalate when:
+- Stripe tax effect is ambiguous
+- settlement relationship is unclear
+- vendor classification is ambiguous
+- a contractor or payroll checklist item is `unknown`
+- compliance profile facts are missing
+- a review blocker would be resolved with override posting
