@@ -6,6 +6,16 @@ Compliance-first CLI bookkeeping for a single-member Illinois LLC.
 
 For an AI-operator manual with workflows, guardrails, and exact command patterns, see [AGENT_GUIDE.md](AGENT_GUIDE.md).
 
+## TUI
+
+For a read-heavy human interface over the same ledger, launch:
+
+```bash
+uv run clawbooks tui --ledger ./demo
+```
+
+If you omit `--ledger`, the app starts in a directory picker and only opens folders that contain both `ledger.db` and `config.toml`. The TUI is intentionally read-heavy in v1: it can review reports and status, and it can generate export bundles, but bookkeeping and compliance actions remain CLI-only.
+
 ## Quick Start
 
 ```bash

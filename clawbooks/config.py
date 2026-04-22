@@ -4,6 +4,7 @@ import os
 import tomllib
 from pathlib import Path
 
+from clawbooks.exceptions import ValidationError
 from clawbooks.schemas import AppConfig
 
 
@@ -16,6 +17,29 @@ def ledger_paths(ledger_dir: Path) -> dict[str, Path]:
         "exports": ledger_dir / "exports",
         "attachments": ledger_dir / "attachments",
     }
+
+
+def is_ledger_dir(path: Path) -> bool:
+    if not path.exists() or not path.is_dir():
+        return False
+    paths = ledger_paths(path)
+    return paths["db"].exists() and paths["config"].exists()
+
+
+def validate_ledger_dir(path: Path) -> Path:
+    resolved = path.expanduser().resolve()
+    if not resolved.exists():
+        raise ValidationError(f"Ledger directory does not exist: {resolved}")
+    if not resolved.is_dir():
+        raise ValidationError(f"Ledger path is not a directory: {resolved}")
+    paths = ledger_paths(resolved)
+    missing = [name for name in ("db", "config") if not paths[name].exists()]
+    if missing:
+        raise ValidationError(
+            f"Directory is not a clawbooks ledger: {resolved}",
+            data={"missing": missing, "ledger_dir": str(resolved)},
+        )
+    return resolved
 
 
 def write_default_config(path: Path, business_name: str) -> None:

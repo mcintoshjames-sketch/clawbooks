@@ -6,10 +6,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 import typer
+from click.core import ParameterSource
 from rich.console import Console
 from rich.table import Table
 
-from clawbooks.config import ledger_paths, load_config, write_default_config
+from clawbooks.config import ledger_paths, load_config, validate_ledger_dir, write_default_config
 from clawbooks.db import create_schema, session_scope
 from clawbooks.exceptions import AppError, ValidationError
 from clawbooks.ledger import (
@@ -79,6 +80,7 @@ class CLIState:
     ledger_dir: Path
     json_mode: bool
     as_of: date | None
+    ledger_supplied: bool
 
 
 @app.callback()
@@ -88,7 +90,13 @@ def main(
     json_mode: bool = typer.Option(False, "--json", help="Emit machine-readable JSON output"),
     as_of: str | None = typer.Option(None, "--as-of", help="Default as-of date"),
 ) -> None:
-    ctx.obj = CLIState(ledger_dir=ledger.resolve(), json_mode=json_mode, as_of=parse_date(as_of))
+    ledger_supplied = ctx.get_parameter_source("ledger") != ParameterSource.DEFAULT
+    ctx.obj = CLIState(
+        ledger_dir=ledger.resolve(),
+        json_mode=json_mode,
+        as_of=parse_date(as_of),
+        ledger_supplied=ledger_supplied,
+    )
 
 
 def _normalize_value(value: object) -> str:
@@ -244,6 +252,23 @@ def init_command(
             "config_path": str(paths["config"]),
         },
     )
+
+
+@app.command("tui")
+def tui_command(
+    ctx: typer.Context,
+    ledger: Path | None = typer.Option(None, "--ledger", help="Ledger directory to open directly"),
+) -> None:
+    state: CLIState = ctx.obj
+    ledger_dir = ledger.resolve() if ledger else (state.ledger_dir if state.ledger_supplied else None)
+    try:
+        if ledger_dir is not None:
+            ledger_dir = validate_ledger_dir(ledger_dir)
+    except AppError as exc:
+        _emit_error(state, "tui", exc)
+    from clawbooks.tui import ClawbooksTuiApp
+
+    ClawbooksTuiApp(ledger_dir=ledger_dir).run()
 
 
 @coa_app.command("show")
