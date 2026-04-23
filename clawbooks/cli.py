@@ -490,7 +490,8 @@ def journal_add(
     description: str = typer.Option(..., "--description"),
     line: list[str] = typer.Option(..., "--line"),
     source_type: str = typer.Option("manual", "--source-type"),
-    non_cash: bool = typer.Option(False, "--non-cash"),
+    # Legacy compatibility flag retained for older scripts; it has no effect on posting semantics.
+    non_cash: bool = typer.Option(False, "--non-cash", hidden=True),
     dry_run: bool = typer.Option(False, "--dry-run"),
 ) -> None:
     lines = _parse_line_specs(line)
@@ -1137,8 +1138,18 @@ def report_equity_rollforward(
     )
 
 
-@report_app.command("owner-equity")
-def report_owner_equity(ctx: typer.Context, as_of: str | None = typer.Option(None, "--as-of")) -> None:
+@report_app.command(
+    "owner-equity",
+    help="Deprecated alias for equity-rollforward. Uses calendar-year-to-date from Jan 1 through --as-of.",
+)
+def report_owner_equity(
+    ctx: typer.Context,
+    as_of: str | None = typer.Option(
+        None,
+        "--as-of",
+        help="End date for the deprecated year-to-date alias; Jan 1 of that year is used as the period start.",
+    ),
+) -> None:
     state: CLIState = ctx.obj
     _run_session_command(
         ctx,
@@ -1172,7 +1183,8 @@ def period_close(
     period_end: str = typer.Option(..., "--period-end"),
     lock_type: str = typer.Option("month", "--lock-type"),
     reason: str | None = typer.Option(None, "--reason"),
-    acknowledge_review_entry: list[int] = typer.Option([], "--acknowledge-review-entry"),
+    # Legacy compatibility flag retained for older scripts; close behavior does not honor it.
+    acknowledge_review_entry: list[int] = typer.Option([], "--acknowledge-review-entry", hidden=True),
     dry_run: bool = typer.Option(False, "--dry-run"),
 ) -> None:
     state: CLIState = ctx.obj

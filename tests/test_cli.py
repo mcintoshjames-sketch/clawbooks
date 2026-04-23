@@ -56,6 +56,21 @@ def test_init_creates_ledger_and_default_accounts(tmp_path: Path) -> None:
     assert any(row["code"] == "2100" for row in body["data"]["rows"])
 
 
+def test_cli_help_hides_dead_flags_and_describes_owner_equity_alias() -> None:
+    journal_help = runner.invoke(app, ["journal", "add", "--help"])
+    assert journal_help.exit_code == 0
+    assert "--non-cash" not in journal_help.stdout
+
+    period_close_help = runner.invoke(app, ["period", "close", "--help"])
+    assert period_close_help.exit_code == 0
+    assert "--acknowledge-review-entry" not in period_close_help.stdout
+
+    owner_equity_help = runner.invoke(app, ["report", "owner-equity", "--help"])
+    assert owner_equity_help.exit_code == 0
+    assert "Deprecated alias for equity-rollforward" in owner_equity_help.stdout
+    assert "calendar-year-to-date" in owner_equity_help.stdout
+
+
 def test_unbalanced_journal_returns_validation_error(tmp_path: Path) -> None:
     ledger = init_ledger(tmp_path)
     result = invoke(
