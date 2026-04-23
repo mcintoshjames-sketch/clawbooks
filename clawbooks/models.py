@@ -245,16 +245,6 @@ class PeriodLock(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
-class Attachment(Base):
-    __tablename__ = "attachments"
-
-    id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    path: Mapped[str] = mapped_column(String(500))
-    sha256: Mapped[str] = mapped_column(String(64))
-    description: Mapped[str | None] = mapped_column(String(500), default=None)
-    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
-
-
 class Document(Base):
     __tablename__ = "documents"
 

@@ -33,6 +33,17 @@ def legacyize_ledger(ledger: Path) -> None:
         connection.execute("DROP TABLE alembic_version")
         connection.execute("DROP TABLE close_snapshots")
         connection.execute("DROP TABLE audit_events")
+        connection.execute(
+            """
+            CREATE TABLE IF NOT EXISTS attachments (
+                id INTEGER NOT NULL PRIMARY KEY,
+                path VARCHAR(500) NOT NULL,
+                sha256 VARCHAR(64) NOT NULL,
+                description VARCHAR(500),
+                created_at DATETIME NOT NULL
+            )
+            """
+        )
         connection.execute("DROP INDEX IF EXISTS ix_documents_jurisdiction")
         connection.execute("PRAGMA foreign_keys=OFF")
         connection.execute(
@@ -108,6 +119,14 @@ def test_doctor_bootstrap_mode_and_migrate_legacy_ledger(tmp_path: Path) -> None
     migrated_body = payload(migrated)
     assert migrated.exit_code == 0
     assert migrated_body["data"]["migration_state"]["full_open_safe"] is True
+    with sqlite3.connect(ledger / "ledger.db") as connection:
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%'"
+            ).fetchall()
+        }
+    assert "attachments" not in tables
 
     full = invoke(ledger, "doctor")
     full_body = payload(full)

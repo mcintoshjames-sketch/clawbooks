@@ -5,7 +5,7 @@ from datetime import UTC, date, datetime
 from pathlib import Path
 
 from clawbooks.db import session_scope
-from clawbooks.models import Attachment, Document, DocumentLink
+from clawbooks.models import Document, DocumentLink
 from clawbooks.schemas import StripeEvent
 from tests.helpers import add_document, init_ledger, invoke_cli
 
@@ -254,11 +254,10 @@ def test_document_checklist_requires_reconciliation_linked_statement_support(tmp
     assert rows["bank_statement_support"]["required_count"] == 1
 
 
-def test_accountant_packet_export_includes_documents_and_excludes_legacy_attachments(tmp_path: Path) -> None:
+def test_accountant_packet_export_includes_registered_documents(tmp_path: Path) -> None:
     ledger = init_ledger(tmp_path)
     receipt = write_text(tmp_path / "receipt.pdf", "receipt-content")
     prior_year_return = write_text(tmp_path / "prior-year-return.pdf", "return-content")
-    legacy_path = write_text(ledger / "attachments" / "legacy_only.pdf", "legacy-content")
 
     recorded = invoke_cli(
         ledger,
@@ -280,10 +279,6 @@ def test_accountant_packet_export_includes_documents_and_excludes_legacy_attachm
     assert recorded.exit_code == 0
     add_document(ledger, source_path=prior_year_return, document_type="prior_year_return", year=2026, scope="owner")
 
-    with session_scope(ledger) as session:
-        session.add(Attachment(path=str(legacy_path), sha256="legacy", description="Legacy", created_at=datetime.now(UTC)))
-        session.commit()
-
     exported = invoke_cli(ledger, "export", "accountant-packet", "--year", "2026")
     body = payload(exported)
     assert exported.exit_code == 0
@@ -304,7 +299,6 @@ def test_accountant_packet_export_includes_documents_and_excludes_legacy_attachm
     assert {"expense_receipt", "prior_year_return"} <= document_types
     packet_files = {str(path.relative_to(output_dir)) for path in output_dir.rglob("*") if path.is_file()}
     assert any(file_name.startswith("documents/") for file_name in packet_files)
-    assert "documents/legacy_only.pdf" not in packet_files
 
     manifest = json.loads((output_dir / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["advisory"] is True

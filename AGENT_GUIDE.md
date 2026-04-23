@@ -494,7 +494,7 @@ Packet rules:
 - the packet is advisory, not filing-ready
 - it includes compliance-profile snapshot and unsupported cash-basis warnings
 - `year_end_books_package` is only `present` after the year-end export exists
-- legacy attachments not registered as documents are not included automatically
+- supporting files are authoritative only when registered as `Document` records
 - cadence-sensitive checklist items require exact period metadata and, for sales-tax items, matching jurisdiction metadata
 
 ## Escalate to a Human or CPA

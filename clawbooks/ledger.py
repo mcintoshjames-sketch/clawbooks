@@ -16,7 +16,6 @@ from clawbooks.defaults import DEFAULT_ACCOUNTS
 from clawbooks.exceptions import ComplianceError, ImportConflictError, LockedPeriodError, ReconciliationError, ValidationError
 from clawbooks.models import (
     Account,
-    Attachment,
     AuditEvent,
     Document,
     DocumentLink,
@@ -840,18 +839,6 @@ def _has_open_reconciliation_matches_for_entry(session: Session, entry_id: int) 
         .where(JournalLine.entry_id == entry_id, ReconciliationMatch.reversed_at.is_(None))
     )
     return bool(count)
-
-
-def record_attachment(session: Session, path: Path, description: str | None = None) -> Attachment:
-    attachment = Attachment(
-        path=str(path),
-        sha256=sha256_for_path(path),
-        description=description,
-        created_at=utcnow(),
-    )
-    session.add(attachment)
-    session.flush()
-    return attachment
 
 
 def record_expense(
