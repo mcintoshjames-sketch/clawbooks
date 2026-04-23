@@ -46,6 +46,9 @@ def add_document(
     source_path: Path,
     document_type: str,
     year: int,
+    jurisdiction: str | None = None,
+    period_start: date | None = None,
+    period_end: date | None = None,
     scope: str = "business",
     notes: str | None = None,
 ) -> None:
@@ -61,6 +64,12 @@ def add_document(
         "--scope",
         scope,
     ]
+    if jurisdiction is not None:
+        args.extend(["--jurisdiction", jurisdiction])
+    if period_start is not None:
+        args.extend(["--period-start", period_start.isoformat()])
+    if period_end is not None:
+        args.extend(["--period-end", period_end.isoformat()])
     if notes is not None:
         args.extend(["--notes", notes])
     result = invoke_cli(ledger, *args)

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -11,8 +12,9 @@ from rich.console import Console
 from rich.table import Table
 
 from clawbooks.config import ledger_paths, load_config, validate_ledger_dir, write_default_config
-from clawbooks.db import create_schema, session_scope
+from clawbooks.db import create_schema, migrate_ledger, session_scope
 from clawbooks.exceptions import AppError, ValidationError
+from clawbooks.integrity import audit_period, doctor as doctor_scan
 from clawbooks.ledger import (
     DOCUMENT_SCOPES,
     DOCUMENT_TYPES,
@@ -32,6 +34,7 @@ from clawbooks.ledger import (
     list_documents,
     list_reconciliation_sessions,
     list_review_blockers,
+    list_sales_tax_payment_slots,
     list_settlements,
     match_reconciliation,
     period_status,
@@ -45,6 +48,7 @@ from clawbooks.ledger import (
     reverse_entry,
     seed_defaults,
     set_compliance_profile,
+    set_sales_tax_payment_expectation,
     start_reconciliation,
     serialize_document,
     retry_review_blocker,
@@ -55,6 +59,7 @@ from clawbooks.reports import (
     balance_sheet,
     cash_flow,
     document_checklist,
+    equity_rollforward,
     export_accountant_packet,
     export_bundle,
     export_year_end,
@@ -85,6 +90,7 @@ settlement_app = typer.Typer(no_args_is_help=True)
 review_app = typer.Typer(no_args_is_help=True)
 compliance_app = typer.Typer(no_args_is_help=True)
 profile_app = typer.Typer(no_args_is_help=True)
+sales_tax_slot_app = typer.Typer(no_args_is_help=True)
 
 app.add_typer(coa_app, name="coa")
 app.add_typer(account_app, name="account")
@@ -101,6 +107,7 @@ app.add_typer(settlement_app, name="settlement")
 app.add_typer(review_app, name="review")
 app.add_typer(compliance_app, name="compliance")
 compliance_app.add_typer(profile_app, name="profile")
+compliance_app.add_typer(sales_tax_slot_app, name="sales-tax-slot")
 
 console = Console()
 
@@ -198,6 +205,23 @@ def _emit_success(state: CLIState, command: str, data: dict[str, Any], warnings:
     else:
         _render_human(command, data, warnings)
     raise typer.Exit(code=0)
+
+
+def _emit_success_with_code(
+    state: CLIState,
+    command: str,
+    data: dict[str, Any],
+    *,
+    warnings: list[str] | None = None,
+    exit_code: int = 0,
+) -> None:
+    warnings = warnings or []
+    envelope = ResultEnvelope(ok=True, command=command, data=data, warnings=warnings, errors=[])
+    if state.json_mode:
+        typer.echo(envelope.model_dump_json(indent=2))
+    else:
+        _render_human(command, data, warnings)
+    raise typer.Exit(code=exit_code)
 
 
 def _emit_error(state: CLIState, command: str, exc: AppError) -> None:
@@ -299,6 +323,30 @@ def tui_command(
     from clawbooks.tui import ClawbooksTuiApp
 
     ClawbooksTuiApp(ledger_dir=ledger_dir).run()
+
+
+@app.command("migrate")
+def migrate_command(ctx: typer.Context) -> None:
+    state: CLIState = ctx.obj
+    try:
+        result = migrate_ledger(state.ledger_dir)
+    except AppError as exc:
+        _emit_error(state, "migrate", exc)
+    _emit_success(state, "migrate", {"migration_state": result})
+
+
+@app.command("doctor")
+def doctor_command(
+    ctx: typer.Context,
+    year: int | None = typer.Option(None, "--year"),
+) -> None:
+    state: CLIState = ctx.obj
+    try:
+        result = doctor_scan(state.ledger_dir, year=year)
+    except AppError as exc:
+        _emit_error(state, "doctor", exc)
+    exit_code = 7 if any(result["summary"].values()) else 0
+    _emit_success_with_code(state, "doctor", result, exit_code=exit_code)
 
 
 @coa_app.command("show")
@@ -441,6 +489,7 @@ def journal_add(
     entry_date: str = typer.Option(..., "--date"),
     description: str = typer.Option(..., "--description"),
     line: list[str] = typer.Option(..., "--line"),
+    source_type: str = typer.Option("manual", "--source-type"),
     non_cash: bool = typer.Option(False, "--non-cash"),
     dry_run: bool = typer.Option(False, "--dry-run"),
 ) -> None:
@@ -455,7 +504,7 @@ def journal_add(
                     entry_date=parse_date(entry_date),
                     description=description,
                     lines=lines,
-                    source_type="manual",
+                    source_type=source_type,
                 ).id,
                 "non_cash_hint": non_cash,
             }
@@ -673,6 +722,7 @@ def document_add(
     source_path: Path = typer.Option(..., "--source-path"),
     document_type: str = typer.Option(..., "--type"),
     year: int = typer.Option(..., "--year"),
+    jurisdiction: str | None = typer.Option(None, "--jurisdiction"),
     scope: str = typer.Option("business", "--scope"),
     period_start: str | None = typer.Option(None, "--period-start"),
     period_end: str | None = typer.Option(None, "--period-end"),
@@ -695,6 +745,7 @@ def document_add(
                     source_path=source_path,
                     document_type=document_type,
                     tax_year=year,
+                    jurisdiction=jurisdiction,
                     scope=scope,
                     period_start=parse_date(period_start),
                     period_end=parse_date(period_end),
@@ -749,6 +800,7 @@ def document_update_command(
     document_id: int = typer.Option(..., "--document-id"),
     document_type: str | None = typer.Option(None, "--type"),
     year: int | None = typer.Option(None, "--year"),
+    jurisdiction: str | None = typer.Option(None, "--jurisdiction"),
     scope: str | None = typer.Option(None, "--scope"),
     period_start: str | None = typer.Option(None, "--period-start"),
     period_end: str | None = typer.Option(None, "--period-end"),
@@ -775,6 +827,7 @@ def document_update_command(
                     document_id=document_id,
                     document_type=document_type,
                     tax_year=year,
+                    jurisdiction=UNSET if jurisdiction is None else jurisdiction,
                     scope=scope,
                     period_start=parsed_period_start,
                     period_end=parsed_period_end,
@@ -937,6 +990,49 @@ def compliance_profile_update(
     )
 
 
+@sales_tax_slot_app.command("list")
+def compliance_sales_tax_slot_list(
+    ctx: typer.Context,
+    year: int | None = typer.Option(None, "--year"),
+) -> None:
+    _run_session_command(
+        ctx,
+        "compliance sales-tax-slot list",
+        lambda session: list_sales_tax_payment_slots(session, year=year),
+    )
+
+
+@sales_tax_slot_app.command("set-payment-expectation")
+def compliance_sales_tax_slot_set_payment_expectation(
+    ctx: typer.Context,
+    jurisdiction: str = typer.Option(..., "--jurisdiction"),
+    period_start: str = typer.Option(..., "--period-start"),
+    period_end: str = typer.Option(..., "--period-end"),
+    filing_due_date: str = typer.Option(..., "--filing-due-date"),
+    payment_expected: str = typer.Option(..., "--payment-expected"),
+    source: str | None = typer.Option(None, "--source"),
+    reason: str | None = typer.Option(None, "--reason"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    _run_session_command(
+        ctx,
+        "compliance sales-tax-slot set-payment-expectation",
+        lambda session: {
+            "profile": set_sales_tax_payment_expectation(
+                session,
+                jurisdiction=jurisdiction,
+                period_start=parse_date(period_start),
+                period_end=parse_date(period_end),
+                filing_due_date=parse_date(filing_due_date),
+                payment_expected=payment_expected,
+                source=source,
+                reason=reason,
+            ).model_dump()
+        },
+        dry_run=dry_run,
+    )
+
+
 @report_app.command("pnl")
 def report_pnl(
     ctx: typer.Context,
@@ -1024,6 +1120,23 @@ def report_tax_liabilities(ctx: typer.Context, as_of: str | None = typer.Option(
     )
 
 
+@report_app.command("equity-rollforward")
+def report_equity_rollforward(
+    ctx: typer.Context,
+    period_start: str = typer.Option(..., "--period-start"),
+    period_end: str = typer.Option(..., "--period-end"),
+) -> None:
+    _run_session_command(
+        ctx,
+        "report equity-rollforward",
+        lambda session: equity_rollforward(
+            session,
+            period_start=parse_date(period_start),
+            period_end=parse_date(period_end),
+        ),
+    )
+
+
 @report_app.command("owner-equity")
 def report_owner_equity(ctx: typer.Context, as_of: str | None = typer.Option(None, "--as-of")) -> None:
     state: CLIState = ctx.obj
@@ -1062,6 +1175,8 @@ def period_close(
     acknowledge_review_entry: list[int] = typer.Option([], "--acknowledge-review-entry"),
     dry_run: bool = typer.Option(False, "--dry-run"),
 ) -> None:
+    state: CLIState = ctx.obj
+    config = load_config(state.ledger_dir)
     _run_session_command(
         ctx,
         "period close",
@@ -1071,6 +1186,8 @@ def period_close(
             period_end=parse_date(period_end),
             lock_type=lock_type,
             reason=reason,
+            ledger_dir=state.ledger_dir,
+            config=config,
             acknowledge_review_ids=acknowledge_review_entry,
         ),
         dry_run=dry_run,
@@ -1108,6 +1225,27 @@ def period_status_command(
         ctx,
         "period status",
         lambda session: period_status(session, period_start=parse_date(period_start), period_end=parse_date(period_end)),
+    )
+
+
+@period_app.command("audit")
+def period_audit_command(
+    ctx: typer.Context,
+    period_start: str = typer.Option(..., "--period-start"),
+    period_end: str = typer.Option(..., "--period-end"),
+) -> None:
+    state: CLIState = ctx.obj
+    config = load_config(state.ledger_dir)
+    _run_session_command(
+        ctx,
+        "period audit",
+        lambda session: audit_period(
+            session,
+            ledger_dir=state.ledger_dir,
+            config=config,
+            period_start=parse_date(period_start),
+            period_end=parse_date(period_end),
+        ),
     )
 
 

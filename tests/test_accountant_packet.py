@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 from pathlib import Path
 
 from clawbooks.db import session_scope
@@ -165,7 +165,8 @@ def test_document_checklist_uses_advisory_unknowns_and_real_books_exports(tmp_pa
     rows_before = {row["item_key"]: row for row in checklist_before["data"]["rows"]}
     assert rows_before["year_end_books_package"]["status"] == "missing"
     assert rows_before["stripe_tax_documents"]["status"] == "missing"
-    assert rows_before["sales_tax_filings"]["status"] == "unknown"
+    assert rows_before["sales_tax_returns"]["status"] == "unknown"
+    assert rows_before["sales_tax_payments"]["status"] == "unknown"
     assert rows_before["payroll_documents"]["status"] == "unknown"
     assert rows_before["contractor_documents"]["status"] == "unknown"
 
@@ -177,6 +178,80 @@ def test_document_checklist_uses_advisory_unknowns_and_real_books_exports(tmp_pa
     rows_after = {row["item_key"]: row for row in checklist_after["data"]["rows"]}
     assert rows_after["year_end_books_package"]["status"] == "present"
     assert rows_after["stripe_tax_documents"]["status"] == "present"
+
+
+def test_document_checklist_uses_slot_based_tax_support_matching(tmp_path: Path) -> None:
+    ledger = init_ledger(tmp_path)
+    assert invoke_cli(
+        ledger,
+        "compliance",
+        "profile",
+        "update",
+        "--json",
+        json.dumps(
+            {
+                "sales_tax_profile_confirmed": True,
+                "sales_tax_registrations": [
+                    {"jurisdiction": "illinois", "filing_cadence": "monthly", "active": True}
+                ],
+                "owner_tracking": {"estimated_tax_confirmations": True},
+            }
+        ),
+    ).exit_code == 0
+
+    january_return = write_text(tmp_path / "il-jan-return.pdf", "jan-return")
+    estimated_q1 = write_text(tmp_path / "estimated-q1.pdf", "q1")
+    add_document(
+        ledger,
+        source_path=january_return,
+        document_type="illinois_sales_tax_return",
+        year=2026,
+        jurisdiction="illinois",
+        period_start=date(2026, 1, 1),
+        period_end=date(2026, 1, 31),
+    )
+    add_document(
+        ledger,
+        source_path=estimated_q1,
+        document_type="estimated_tax_confirmation",
+        year=2026,
+        period_start=date(2026, 1, 1),
+        period_end=date(2026, 3, 31),
+    )
+
+    checklist = payload(invoke_cli(ledger, "document", "checklist", "--year", "2026"))
+    rows = {row["item_key"]: row for row in checklist["data"]["rows"]}
+    assert rows["sales_tax_returns"]["status"] == "missing"
+    assert len(rows["sales_tax_returns"]["slot_details"]) == 12
+    assert rows["estimated_tax_confirmations"]["status"] == "missing"
+    assert len(rows["estimated_tax_confirmations"]["slot_details"]) == 4
+    assert rows["sales_tax_payments"]["status"] == "unknown"
+
+
+def test_document_checklist_requires_reconciliation_linked_statement_support(tmp_path: Path) -> None:
+    ledger = init_ledger(tmp_path)
+    assert invoke_cli(
+        ledger,
+        "journal",
+        "add",
+        "--date",
+        "2026-03-31",
+        "--description",
+        "Opening bank balance",
+        "--line",
+        "1000:500.00",
+        "--line",
+        "3000:-500.00",
+    ).exit_code == 0
+
+    generic_statement = write_text(tmp_path / "bank-statement.pdf", "generic-statement")
+    add_document(ledger, source_path=generic_statement, document_type="bank_statement", year=2026)
+
+    checklist = payload(invoke_cli(ledger, "document", "checklist", "--year", "2026"))
+    rows = {row["item_key"]: row for row in checklist["data"]["rows"]}
+    assert rows["bank_statement_support"]["status"] == "missing"
+    assert rows["bank_statement_support"]["document_count"] == 0
+    assert rows["bank_statement_support"]["required_count"] == 1
 
 
 def test_accountant_packet_export_includes_documents_and_excludes_legacy_attachments(tmp_path: Path) -> None:

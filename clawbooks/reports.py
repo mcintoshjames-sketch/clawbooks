@@ -4,9 +4,11 @@ import csv
 import json
 import shutil
 import zipfile
+from calendar import monthrange
 from collections import defaultdict
 from datetime import date, timedelta
 from pathlib import Path
+from typing import Callable
 
 from sqlalchemy import func, select
 from sqlalchemy.orm import Session, selectinload
@@ -20,6 +22,7 @@ from clawbooks.ledger import (
     get_compliance_profile,
     is_immediate_cash_source_line,
     list_documents,
+    reconciliation_coverage_summary,
     serialize_document,
 )
 from clawbooks.models import (
@@ -39,12 +42,18 @@ from clawbooks.utils import json_dumps, utcnow, year_bounds
 
 
 def _write_csv(path: Path, rows: list[dict[str, object]]) -> None:
-    fieldnames = list(rows[0].keys()) if rows else ["empty"]
+    fieldnames = sorted({key for row in rows for key in row.keys()}) if rows else ["empty"]
     with path.open("w", newline="", encoding="utf-8") as handle:
         writer = csv.DictWriter(handle, fieldnames=fieldnames)
         writer.writeheader()
         if rows:
-            writer.writerows(rows)
+            writer.writerows(
+                {
+                    key: json_dumps(value) if isinstance(value, (dict, list)) else value
+                    for key, value in row.items()
+                }
+                for row in rows
+            )
         else:
             writer.writerow({"empty": ""})
 
@@ -220,6 +229,13 @@ def cash_basis_snapshot(session: Session, *, period_start: date, period_end: dat
         if settled_in_period >= abs(source_line.amount_cents):
             continue
         excluded_amount = abs(source_line.amount_cents) - settled_in_period
+        exclusion_reason = reason or "Manual accrual requires explicit settlement"
+        if (
+            source_line.entry.source_type == "expense"
+            and source_line.account.kind == "expense"
+            and any(line.account.code == "2300" for line in source_line.entry.lines if line.id != source_line.id)
+        ):
+            exclusion_reason = "Reimbursable owner-paid expense requires exact one-source reimbursement auto-link or manual settlement"
         excluded_lines.append(
             {
                 "line_id": source_line.id,
@@ -228,7 +244,7 @@ def cash_basis_snapshot(session: Session, *, period_start: date, period_end: dat
                 "account_code": source_line.account.code,
                 "account_name": source_line.account.name,
                 "excluded_amount_cents": excluded_amount,
-                "reason": reason or "Manual accrual requires explicit settlement",
+                "reason": exclusion_reason,
             }
         )
         warnings.append(
@@ -431,16 +447,52 @@ def tax_liabilities(session: Session, *, as_of: date) -> dict[str, object]:
     }
 
 
+def equity_rollforward(session: Session, *, period_start: date, period_end: date) -> dict[str, object]:
+    opening_equity = balance_sheet(session, as_of=period_start - timedelta(days=1))["totals"]["equity_cents"]
+    ending_equity = balance_sheet(session, as_of=period_end)["totals"]["equity_cents"]
+    current_period_earnings = pnl(session, period_start=period_start, period_end=period_end, basis="accrual")["totals"]["net_income_cents"]
+
+    entries = list(
+        session.scalars(
+            select(JournalEntry)
+            .options(selectinload(JournalEntry.lines).selectinload(JournalLine.account))
+            .where(JournalEntry.entry_date >= period_start, JournalEntry.entry_date <= period_end)
+            .order_by(JournalEntry.entry_date, JournalEntry.id)
+        )
+    )
+    owner_contributions = 0
+    owner_draws = 0
+    for entry in entries:
+        if entry.source_type == "expense":
+            owner_contributions += sum(-line.amount_cents for line in entry.lines if line.account.code == "3000")
+        elif entry.source_type == "owner_contribution":
+            owner_contributions += sum(-line.amount_cents for line in entry.lines if line.account.code == "3000")
+        elif entry.source_type == "owner_draw":
+            owner_draws += sum(line.amount_cents for line in entry.lines if line.account.code == "3100")
+
+    other_equity_adjustments = ending_equity - opening_equity - current_period_earnings - owner_contributions + owner_draws
+    rows = [
+        {"component": "opening_equity", "title": "Opening Equity", "amount_cents": opening_equity},
+        {"component": "owner_contributions", "title": "Owner Contributions", "amount_cents": owner_contributions},
+        {"component": "owner_draws", "title": "Owner Draws", "amount_cents": owner_draws},
+        {"component": "current_period_earnings", "title": "Current Period Earnings", "amount_cents": current_period_earnings},
+        {"component": "other_equity_adjustments", "title": "Other Equity Adjustments", "amount_cents": other_equity_adjustments},
+        {"component": "ending_equity", "title": "Ending Equity", "amount_cents": ending_equity},
+    ]
+    return {
+        "period_start": period_start,
+        "period_end": period_end,
+        "report_basis": "accrual",
+        "rows": rows,
+        "totals": {row["component"]: row["amount_cents"] for row in rows},
+    }
+
+
 def owner_equity(session: Session, *, as_of: date) -> dict[str, object]:
-    rows = []
-    for code in ("3000", "3100"):
-        account = session.scalar(select(Account).where(Account.code == code))
-        if not account:
-            continue
-        raw = account_balance_as_of(session, account_id=account.id, as_of=as_of)
-        rows.append({"code": account.code, "name": account.name, "amount_cents": display_balance(account, raw)})
-    totals = {row["code"]: row["amount_cents"] for row in rows}
-    return {"as_of": as_of, "report_basis": "accrual", "rows": rows, "totals": totals}
+    payload = equity_rollforward(session, period_start=date(as_of.year, 1, 1), period_end=as_of)
+    payload["deprecated_alias"] = True
+    payload["as_of"] = as_of
+    return payload
 
 
 def tax_rollforward(session: Session, *, period_start: date, period_end: date) -> dict[str, object]:
@@ -463,39 +515,7 @@ def tax_rollforward(session: Session, *, period_start: date, period_end: date) -
 
 
 def reconciliation_summary(session: Session, *, period_start: date, period_end: date) -> dict[str, object]:
-    sessions = list(
-        session.scalars(
-            select(ReconciliationSession)
-            .options(selectinload(ReconciliationSession.account), selectinload(ReconciliationSession.lines).selectinload(ReconciliationLine.matches))
-            .where(
-                ReconciliationSession.statement_start >= period_start,
-                ReconciliationSession.statement_end <= period_end,
-            )
-            .order_by(ReconciliationSession.statement_end, ReconciliationSession.id)
-        )
-    )
-    rows = []
-    for item in sessions:
-        unresolved = sum(1 for line in item.lines if abs(line.amount_cents) != sum(match.applied_amount_cents for match in line.matches if match.reversed_at is None))
-        rows.append(
-            {
-                "session_id": item.id,
-                "account_code": item.account.code,
-                "account_name": item.account.name,
-                "statement_start": item.statement_start,
-                "statement_end": item.statement_end,
-                "statement_starting_balance_cents": item.statement_starting_balance_cents,
-                "statement_ending_balance_cents": item.statement_ending_balance_cents,
-                "status": item.status,
-                "unresolved_statement_lines": unresolved,
-            }
-        )
-    return {
-        "period_start": period_start,
-        "period_end": period_end,
-        "report_basis": "control",
-        "sessions": rows,
-    }
+    return reconciliation_coverage_summary(session, period_start=period_start, period_end=period_end)
 
 
 def review_blocker_summary(session: Session, *, period_start: date, period_end: date) -> dict[str, object]:
@@ -617,8 +637,9 @@ def _checklist_row(
     required_count: int,
     document_types: str,
     notes: str,
+    slot_details: list[dict[str, object]] | None = None,
 ) -> dict[str, object]:
-    return {
+    row = {
         "item_key": item_key,
         "title": title,
         "status": status,
@@ -627,6 +648,250 @@ def _checklist_row(
         "document_types": document_types,
         "notes": notes,
     }
+    if slot_details is not None:
+        row["slot_details"] = slot_details
+    return row
+
+
+def _normalized_jurisdiction(value: object) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower().replace(" ", "_")
+    aliases = {
+        "il": "illinois",
+        "ill": "illinois",
+        "irs": "federal",
+        "us": "federal",
+        "usa": "federal",
+    }
+    return aliases.get(normalized, normalized) or None
+
+
+def _document_type_for_sales_tax(kind: str, jurisdiction: str) -> str | None:
+    mappings = {
+        ("return", "illinois"): "illinois_sales_tax_return",
+        ("payment", "illinois"): "illinois_sales_tax_payment",
+    }
+    return mappings.get((kind, jurisdiction))
+
+
+def _estimated_tax_slots(year: int) -> list[dict[str, object]]:
+    return [
+        {
+            "slot_id": f"estimated_q{index}_{year}",
+            "title": f"Estimated Tax Q{index} {year}",
+            "jurisdiction": "federal",
+            "period_start": start,
+            "period_end": end,
+            "filing_due_date": due_date,
+        }
+        for index, start, end, due_date in (
+            (1, date(year, 1, 1), date(year, 3, 31), date(year, 4, 15)),
+            (2, date(year, 4, 1), date(year, 5, 31), date(year, 6, 15)),
+            (3, date(year, 6, 1), date(year, 8, 31), date(year, 9, 15)),
+            (4, date(year, 9, 1), date(year, 12, 31), date(year + 1, 1, 15)),
+        )
+    ]
+
+
+def _next_month_anchor(value: date) -> date:
+    if value.month == 12:
+        return date(value.year + 1, 1, 20)
+    return date(value.year, value.month + 1, 20)
+
+
+def _sales_tax_return_slots(profile, year: int) -> tuple[list[dict[str, object]], bool]:
+    slots: list[dict[str, object]] = []
+    unsupported_cadence = False
+    for registration in profile.sales_tax_registrations:
+        if not registration.active:
+            continue
+        jurisdiction = _normalized_jurisdiction(registration.jurisdiction)
+        cadence = registration.filing_cadence.strip().lower()
+        if cadence not in {"monthly", "quarterly", "annual"} or jurisdiction is None:
+            unsupported_cadence = True
+            continue
+        if cadence == "monthly":
+            for month in range(1, 13):
+                period_start = date(year, month, 1)
+                period_end = date(year, month, monthrange(year, month)[1])
+                slots.append(
+                    {
+                        "slot_id": f"{jurisdiction}_{year}_{month:02d}",
+                        "title": f"{jurisdiction.title()} {period_start.strftime('%b %Y')}",
+                        "jurisdiction": jurisdiction,
+                        "period_start": period_start,
+                        "period_end": period_end,
+                        "filing_due_date": _next_month_anchor(period_end),
+                    }
+                )
+        elif cadence == "quarterly":
+            quarter_ranges = (
+                (date(year, 1, 1), date(year, 3, 31)),
+                (date(year, 4, 1), date(year, 6, 30)),
+                (date(year, 7, 1), date(year, 9, 30)),
+                (date(year, 10, 1), date(year, 12, 31)),
+            )
+            for index, (period_start, period_end) in enumerate(quarter_ranges, start=1):
+                slots.append(
+                    {
+                        "slot_id": f"{jurisdiction}_{year}_q{index}",
+                        "title": f"{jurisdiction.title()} Q{index} {year}",
+                        "jurisdiction": jurisdiction,
+                        "period_start": period_start,
+                        "period_end": period_end,
+                        "filing_due_date": _next_month_anchor(period_end),
+                    }
+                )
+        else:
+            period_start = date(year, 1, 1)
+            period_end = date(year, 12, 31)
+            slots.append(
+                {
+                    "slot_id": f"{jurisdiction}_{year}_annual",
+                    "title": f"{jurisdiction.title()} Annual {year}",
+                    "jurisdiction": jurisdiction,
+                    "period_start": period_start,
+                    "period_end": period_end,
+                    "filing_due_date": _next_month_anchor(period_end),
+                }
+            )
+    return slots, unsupported_cadence
+
+
+def _slot_match_key(*, jurisdiction: str | None, period_start: date | None, period_end: date | None) -> tuple[str | None, date | None, date | None]:
+    return (jurisdiction, period_start, period_end)
+
+
+def _slot_detail_status(
+    *,
+    slots: list[dict[str, object]],
+    documents: list[dict[str, object]],
+    document_type_for_slot: Callable[[dict[str, object]], str | None],
+    require_jurisdiction: bool,
+) -> tuple[list[dict[str, object]], int, bool]:
+    expected_keys = {
+        _slot_match_key(
+            jurisdiction=_normalized_jurisdiction(slot.get("jurisdiction")) if require_jurisdiction else None,
+            period_start=slot.get("period_start"),
+            period_end=slot.get("period_end"),
+        )
+        for slot in slots
+    }
+    ambiguous = False
+    matched_count = 0
+    slot_details: list[dict[str, object]] = []
+    for document in documents:
+        normalized_jurisdiction = _normalized_jurisdiction(document.get("jurisdiction"))
+        if require_jurisdiction and normalized_jurisdiction is None:
+            ambiguous = True
+            continue
+        if document.get("period_start") is None or document.get("period_end") is None:
+            ambiguous = True
+            continue
+        match_key = _slot_match_key(
+            jurisdiction=normalized_jurisdiction if require_jurisdiction else None,
+            period_start=document.get("period_start"),
+            period_end=document.get("period_end"),
+        )
+        if require_jurisdiction and normalized_jurisdiction not in {key[0] for key in expected_keys}:
+            continue
+        if match_key not in expected_keys:
+            ambiguous = True
+
+    for slot in slots:
+        expected_type = document_type_for_slot(slot)
+        matched_documents = [
+            document
+            for document in documents
+            if document.get("document_type") == expected_type
+            and document.get("period_start") == slot["period_start"]
+            and document.get("period_end") == slot["period_end"]
+            and (
+                not require_jurisdiction
+                or _normalized_jurisdiction(document.get("jurisdiction")) == _normalized_jurisdiction(slot.get("jurisdiction"))
+            )
+        ]
+        matched_count += len(matched_documents)
+        slot_details.append(
+            {
+                "slot_id": slot["slot_id"],
+                "title": slot["title"],
+                "jurisdiction": slot.get("jurisdiction"),
+                "period_start": slot["period_start"],
+                "period_end": slot["period_end"],
+                "filing_due_date": slot["filing_due_date"],
+                "status": "present" if matched_documents else "missing",
+                "document_ids": [document["document_id"] for document in matched_documents],
+            }
+        )
+    return slot_details, matched_count, ambiguous
+
+
+def _linked_reconciliation_session_ids(document: dict[str, object]) -> set[int]:
+    return {
+        int(link["target_id"])
+        for link in document.get("links", [])
+        if link.get("target_type") == "reconciliation_session"
+    }
+
+
+def _statement_support_checklist_row(
+    *,
+    coverage: dict[str, object],
+    documents: list[dict[str, object]],
+    subtype: str,
+    item_key: str,
+    title: str,
+    doc_type: str,
+) -> dict[str, object]:
+    subtype_rows = [row for row in coverage["coverage_rows"] if row.get("account_subtype") == subtype]
+    relevant_account_codes = {row["account_code"] for row in subtype_rows}
+    relevant_sessions = [
+        session_row
+        for session_row in coverage["sessions"]
+        if session_row["account_code"] in relevant_account_codes
+    ]
+    required_for_close = any(row["required_for_close"] for row in subtype_rows)
+    supporting_document_ids: set[int] = set()
+    session_details: list[dict[str, object]] = []
+    for session_row in relevant_sessions:
+        matching_documents = [
+            document
+            for document in documents
+            if session_row["session_id"] in _linked_reconciliation_session_ids(document)
+            and document.get("period_start") == session_row["statement_start"]
+            and document.get("period_end") == session_row["statement_end"]
+        ]
+        supporting_document_ids.update(int(document["document_id"]) for document in matching_documents)
+        session_details.append(
+            {
+                "session_id": session_row["session_id"],
+                "account_code": session_row["account_code"],
+                "statement_start": session_row["statement_start"],
+                "statement_end": session_row["statement_end"],
+                "status": "present" if matching_documents else "missing",
+                "document_ids": [int(document["document_id"]) for document in matching_documents],
+            }
+        )
+
+    if not required_for_close:
+        status = "not_applicable"
+    elif relevant_sessions and all(item["status"] == "present" for item in session_details):
+        status = "present"
+    else:
+        status = "missing"
+
+    return _checklist_row(
+        item_key=item_key,
+        title=title,
+        status=status,
+        document_count=len(supporting_document_ids),
+        required_count=len(relevant_sessions) if relevant_sessions else (1 if required_for_close else 0),
+        document_types=doc_type,
+        notes="Statement support only counts when a statement document is linked to the relevant reconciliation session and matches that statement window.",
+        slot_details=session_details or None,
+    )
 
 
 def document_checklist(session: Session, *, ledger_dir: Path, year: int) -> dict[str, object]:
@@ -640,6 +905,7 @@ def document_checklist(session: Session, *, ledger_dir: Path, year: int) -> dict
     profile = get_compliance_profile(session)
     paths = ledger_paths(ledger_dir)
     year_end_manifest = paths["exports"] / f"year-end_{year}" / "manifest.json"
+    coverage = reconciliation_summary(session, period_start=period_start, period_end=period_end)
 
     rows: list[dict[str, object]] = [
         _checklist_row(
@@ -667,40 +933,176 @@ def document_checklist(session: Session, *, ledger_dir: Path, year: int) -> dict
         )
     )
 
-    estimated_docs = len(by_type["estimated_tax_confirmation"])
-    estimated_status = "present" if estimated_docs else ("missing" if profile.owner_tracking.estimated_tax_confirmations else "optional")
+    estimated_slot_details, estimated_document_count, estimated_ambiguous = _slot_detail_status(
+        slots=_estimated_tax_slots(year),
+        documents=by_type["estimated_tax_confirmation"],
+        document_type_for_slot=lambda _slot: "estimated_tax_confirmation",
+        require_jurisdiction=False,
+    )
+    if estimated_ambiguous:
+        estimated_status = "unknown"
+    elif not profile.owner_tracking.estimated_tax_confirmations:
+        estimated_status = "present" if estimated_document_count else "optional"
+    else:
+        estimated_status = "present" if all(slot["status"] == "present" for slot in estimated_slot_details) else "missing"
     rows.append(
         _checklist_row(
             item_key="estimated_tax_confirmations",
             title="Estimated Tax Confirmations",
             status=estimated_status,
-            document_count=estimated_docs,
-            required_count=1 if profile.owner_tracking.estimated_tax_confirmations else 0,
+            document_count=estimated_document_count,
+            required_count=len(estimated_slot_details) if profile.owner_tracking.estimated_tax_confirmations else 0,
             document_types="estimated_tax_confirmation",
             notes="Owner-level estimate confirmations are advisory unless you explicitly choose to track them in the compliance profile.",
+            slot_details=estimated_slot_details,
         )
     )
 
-    sales_tax_docs = len(by_type["illinois_sales_tax_return"]) + len(by_type["illinois_sales_tax_payment"])
-    if sales_tax_docs:
-        sales_tax_status = "present"
-        sales_tax_required = 0
-    elif not profile.sales_tax_profile_confirmed:
-        sales_tax_status = "unknown"
-        sales_tax_required = 0
+    active_regs = [registration for registration in profile.sales_tax_registrations if registration.active]
+    sales_tax_slots, unsupported_sales_tax_cadence = _sales_tax_return_slots(profile, year)
+    unsupported_sales_tax_documents = any(
+        _document_type_for_sales_tax("return", _normalized_jurisdiction(slot.get("jurisdiction")) or "") is None
+        or _document_type_for_sales_tax("payment", _normalized_jurisdiction(slot.get("jurisdiction")) or "") is None
+        for slot in sales_tax_slots
+    )
+    sales_tax_return_docs = [
+        document
+        for document in payloads
+        if document["document_type"] in {"illinois_sales_tax_return"}
+    ]
+    if not profile.sales_tax_profile_confirmed:
+        sales_tax_returns_status = "unknown"
+        sales_tax_return_details: list[dict[str, object]] = []
+        sales_tax_return_count = 0
+    elif not active_regs:
+        sales_tax_returns_status = "not_applicable"
+        sales_tax_return_details = []
+        sales_tax_return_count = 0
+    elif unsupported_sales_tax_cadence or unsupported_sales_tax_documents:
+        sales_tax_returns_status = "unknown"
+        sales_tax_return_details = []
+        sales_tax_return_count = 0
     else:
-        active_regs = [registration for registration in profile.sales_tax_registrations if registration.active]
-        sales_tax_status = "missing" if active_regs else "not_applicable"
-        sales_tax_required = len(active_regs)
+        sales_tax_return_details, sales_tax_return_count, sales_tax_returns_ambiguous = _slot_detail_status(
+            slots=sales_tax_slots,
+            documents=sales_tax_return_docs,
+            document_type_for_slot=lambda slot: _document_type_for_sales_tax("return", _normalized_jurisdiction(slot.get("jurisdiction")) or ""),
+            require_jurisdiction=True,
+        )
+        if sales_tax_returns_ambiguous:
+            sales_tax_returns_status = "unknown"
+        else:
+            sales_tax_returns_status = "present" if all(slot["status"] == "present" for slot in sales_tax_return_details) else "missing"
     rows.append(
         _checklist_row(
-            item_key="sales_tax_filings",
-            title="Configured Sales Tax Returns and Payments",
-            status=sales_tax_status,
-            document_count=sales_tax_docs,
-            required_count=sales_tax_required,
-            document_types="illinois_sales_tax_return,illinois_sales_tax_payment",
+            item_key="sales_tax_returns",
+            title="Configured Sales Tax Returns",
+            status=sales_tax_returns_status,
+            document_count=sales_tax_return_count,
+            required_count=len(sales_tax_slots) if profile.sales_tax_profile_confirmed and active_regs and not unsupported_sales_tax_cadence else 0,
+            document_types="illinois_sales_tax_return",
             notes="Sales-tax filing items stay advisory until registrations and cadence are explicitly confirmed in the compliance profile.",
+            slot_details=sales_tax_return_details,
+        )
+    )
+
+    sales_tax_payment_docs = [
+        document
+        for document in payloads
+        if document["document_type"] in {"illinois_sales_tax_payment"}
+    ]
+    payment_slot_map = {
+        (
+            _normalized_jurisdiction(slot.jurisdiction),
+            slot.period_start,
+            slot.period_end,
+            slot.filing_due_date,
+        ): slot
+        for slot in profile.sales_tax_payment_slots
+    }
+    payment_slot_details: list[dict[str, object]] = []
+    payment_required_count = 0
+    payment_document_count = 0
+    payments_unknown = False
+    payments_missing = False
+    if not profile.sales_tax_profile_confirmed:
+        sales_tax_payments_status = "unknown"
+    elif not active_regs:
+        sales_tax_payments_status = "not_applicable"
+    elif unsupported_sales_tax_cadence or unsupported_sales_tax_documents:
+        sales_tax_payments_status = "unknown"
+    else:
+        expected_slot_keys = {
+            (_normalized_jurisdiction(slot.get("jurisdiction")), slot.get("period_start"), slot.get("period_end"))
+            for slot in sales_tax_slots
+        }
+        for document in sales_tax_payment_docs:
+            normalized_jurisdiction = _normalized_jurisdiction(document.get("jurisdiction"))
+            if normalized_jurisdiction is None or document.get("period_start") is None or document.get("period_end") is None:
+                payments_unknown = True
+                continue
+            if (
+                normalized_jurisdiction,
+                document.get("period_start"),
+                document.get("period_end"),
+            ) not in expected_slot_keys:
+                payments_unknown = True
+        for slot in sales_tax_slots:
+            meta = payment_slot_map.get(
+                (
+                    _normalized_jurisdiction(slot.get("jurisdiction")),
+                    slot["period_start"],
+                    slot["period_end"],
+                    slot["filing_due_date"],
+                )
+            )
+            matching_documents = [
+                document
+                for document in sales_tax_payment_docs
+                if document["document_type"] == _document_type_for_sales_tax("payment", _normalized_jurisdiction(slot.get("jurisdiction")) or "")
+                and document.get("period_start") == slot["period_start"]
+                and document.get("period_end") == slot["period_end"]
+                and _normalized_jurisdiction(document.get("jurisdiction")) == _normalized_jurisdiction(slot.get("jurisdiction"))
+            ]
+            payment_document_count += len(matching_documents)
+            if meta is None or meta.payment_expected == "unknown":
+                slot_status = "unknown"
+                payments_unknown = True
+            elif meta.payment_expected == "false":
+                slot_status = "not_applicable"
+            else:
+                payment_required_count += 1
+                slot_status = "present" if matching_documents else "missing"
+                payments_missing = payments_missing or slot_status == "missing"
+            payment_slot_details.append(
+                {
+                    "slot_id": slot["slot_id"],
+                    "title": slot["title"],
+                    "jurisdiction": slot.get("jurisdiction"),
+                    "period_start": slot["period_start"],
+                    "period_end": slot["period_end"],
+                    "filing_due_date": slot["filing_due_date"],
+                    "payment_expected": None if meta is None else meta.payment_expected,
+                    "status": slot_status,
+                    "document_ids": [document["document_id"] for document in matching_documents],
+                }
+            )
+        if payments_unknown:
+            sales_tax_payments_status = "unknown"
+        elif payments_missing:
+            sales_tax_payments_status = "missing"
+        else:
+            sales_tax_payments_status = "present"
+    rows.append(
+        _checklist_row(
+            item_key="sales_tax_payments",
+            title="Configured Sales Tax Payments",
+            status=sales_tax_payments_status,
+            document_count=payment_document_count,
+            required_count=payment_required_count,
+            document_types="illinois_sales_tax_payment",
+            notes="Sales-tax payment completeness stays unknown until explicit filing-slot payment expectations are recorded in the compliance profile.",
+            slot_details=payment_slot_details,
         )
     )
 
@@ -709,25 +1111,14 @@ def document_checklist(session: Session, *, ledger_dir: Path, year: int) -> dict
         ("card", "card_statement_support", "Card Statement Support", "card_statement"),
         ("stripe_clearing", "stripe_statement_support", "Stripe Statement Support", "stripe_statement"),
     ):
-        activity_count = _subtype_activity_count(session, subtype=subtype, period_start=period_start, period_end=period_end)
-        reconciliation_count = _reconciliation_count(session, subtype=subtype, period_start=period_start, period_end=period_end)
-        document_count = len(by_type[doc_type])
-        required_count = max(reconciliation_count, 1 if activity_count else 0)
-        if required_count == 0:
-            status = "not_applicable"
-        elif document_count >= required_count:
-            status = "present"
-        else:
-            status = "missing"
         rows.append(
-            _checklist_row(
+            _statement_support_checklist_row(
+                coverage=coverage,
+                documents=by_type[doc_type],
+                subtype=subtype,
                 item_key=item_key,
                 title=title,
-                status=status,
-                document_count=document_count,
-                required_count=required_count,
-                document_types=doc_type,
-                notes="Financial statement support is driven by direct activity and reconciliation facts, not advisory tax assumptions.",
+                doc_type=doc_type,
             )
         )
 
@@ -870,7 +1261,7 @@ def export_bundle(
         "general_ledger": general_ledger(session, period_start=period_start, period_end=period_end, include_line_ids=True),
         "tax_liabilities": tax_liabilities(session, as_of=period_end),
         "tax_rollforward": tax_rollforward(session, period_start=period_start, period_end=period_end),
-        "owner_equity": owner_equity(session, as_of=period_end),
+        "equity_rollforward": equity_rollforward(session, period_start=period_start, period_end=period_end),
         "reconciliation_summary": reconciliation_summary(session, period_start=period_start, period_end=period_end),
         "review_blockers": review_blocker_summary(session, period_start=period_start, period_end=period_end),
         "import_manifest": import_manifest(session, period_start=period_start, period_end=period_end),

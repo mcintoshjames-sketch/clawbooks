@@ -8,6 +8,7 @@ from typing import Literal
 from sqlalchemy import func, select
 
 from clawbooks.config import is_ledger_dir, load_config, validate_ledger_dir
+from clawbooks.integrity import audit_period, doctor as doctor_scan
 from clawbooks.db import session_scope
 from clawbooks.ledger import (
     DOCUMENT_TYPES,
@@ -24,11 +25,11 @@ from clawbooks.reports import (
     balance_sheet,
     cash_flow,
     document_checklist,
+    equity_rollforward,
     export_accountant_packet,
     export_bundle,
     export_year_end,
     general_ledger,
-    owner_equity,
     pnl,
     tax_liabilities,
     tax_rollforward,
@@ -55,7 +56,7 @@ REPORTS: dict[str, ReportDescriptor] = {
     "trial_balance": ReportDescriptor("trial_balance", "Trial Balance", "as_of", "CUSTOM"),
     "general_ledger": ReportDescriptor("general_ledger", "General Ledger", "range", "MTD"),
     "tax_liabilities": ReportDescriptor("tax_liabilities", "Tax Liabilities", "as_of", "CUSTOM"),
-    "owner_equity": ReportDescriptor("owner_equity", "Owner Equity", "as_of", "CUSTOM"),
+    "equity_rollforward": ReportDescriptor("equity_rollforward", "Equity Rollforward", "range", "YTD"),
     "tax_rollforward": ReportDescriptor("tax_rollforward", "Tax Rollforward", "range", "QTD"),
 }
 
@@ -193,8 +194,8 @@ class TuiFacade:
                 payload = general_ledger(session, period_start=start, period_end=end, include_line_ids=True)
             elif report_key == "tax_liabilities":
                 payload = tax_liabilities(session, as_of=as_of)
-            elif report_key == "owner_equity":
-                payload = owner_equity(session, as_of=as_of)
+            elif report_key == "equity_rollforward":
+                payload = equity_rollforward(session, period_start=start, period_end=end)
             else:
                 payload = tax_rollforward(session, period_start=start, period_end=end)
 
@@ -335,14 +336,30 @@ class TuiFacade:
         prefix = f"uv run clawbooks --ledger '{ledger}' --json"
         return [
             HelpCommand("Record expense", "Use the CLI for new manual expenses.", f"{prefix} expense record --date YYYY-MM-DD --vendor 'Vendor' --amount 0.00 --category 5199 --payment-account 1000"),
-            HelpCommand("Add document", "Register source or tax documents with the packet builder.", f"{prefix} document add --source-path /path/to/file.pdf --type stripe_1099_k --year YYYY"),
+            HelpCommand("Add document", "Register source or tax documents with the packet builder.", f"{prefix} document add --source-path /path/to/file.pdf --type stripe_1099_k --year YYYY --jurisdiction illinois"),
             HelpCommand("Import Stripe", "Stripe imports stay in the CLI in v1.", f"{prefix} import stripe --from-date YYYY-MM-DD --to-date YYYY-MM-DD --dry-run"),
             HelpCommand("Import CSV", "CSV imports stay in the CLI in v1.", f"{prefix} import csv --account-code 1000 --csv-path /path/to/file.csv --profile-path /path/to/profile.json --statement-starting-balance 0.00 --statement-ending-balance 0.00 --dry-run"),
             HelpCommand("Reconcile", "Use candidate discovery and amount-based matching in the CLI; void mistaken sessions instead of replacing them in place.", f"{prefix} reconcile candidates --session-id 1"),
-            HelpCommand("Settlement", "Explicit settlement drives supported cash-basis reporting, but immediate-cash entries cannot double as settlement cash.", f"{prefix} settlement apply --source-line-id 10 --settlement-line-id 42 --amount 100.00"),
+            HelpCommand("Settlement", "Explicit settlement drives supported cash-basis reporting; exact one-source owner reimbursements auto-link, everything else stays manual.", f"{prefix} settlement apply --source-line-id 10 --settlement-line-id 42 --amount 100.00"),
             HelpCommand("Review blockers", "List open blockers first; retry refreshes current Stripe facts instead of replaying stale payloads.", f"{prefix} review list --status open"),
             HelpCommand("Compliance profile", "Checklist applicability comes from the compliance profile.", f"{prefix} compliance profile show"),
+            HelpCommand("Sales-tax slots", "Sales-tax payment completeness depends on explicit filing-slot expectations.", f"{prefix} compliance sales-tax-slot list --year YYYY"),
+            HelpCommand("Doctor", "Run the integrity scan from the CLI for the full machine-readable finding set.", f"{prefix} doctor --year YYYY"),
+            HelpCommand("Period audit", "Use the CLI or Audit pane to inspect close readiness and close-snapshot drift.", f"{prefix} period audit --period-start YYYY-MM-DD --period-end YYYY-MM-DD"),
         ]
+
+    def audit_summary(self, *, year: int | None = None) -> dict[str, object]:
+        return doctor_scan(self.ledger_dir, year=year)
+
+    def audit_period(self, *, period_start: date, period_end: date) -> dict[str, object]:
+        with session_scope(self.ledger_dir) as session:
+            return audit_period(
+                session,
+                ledger_dir=self.ledger_dir,
+                config=self.config,
+                period_start=period_start,
+                period_end=period_end,
+            )
 
     def available_document_types(self) -> list[str]:
         return sorted(DOCUMENT_TYPES)
@@ -493,9 +510,13 @@ class TuiFacade:
                     "No obligations due.",
                 ),
             ]
-        elif descriptor.key == "owner_equity":
-            metrics = [Metric(row["name"], format_money(int(row["amount_cents"]))) for row in payload["rows"]]
-            sections = [TableSection("Owner Equity", ["code", "name", "amount_cents"], payload["rows"], "No owner equity activity.")]
+        elif descriptor.key == "equity_rollforward":
+            metrics = [
+                Metric("Opening Equity", format_money(int(payload["totals"]["opening_equity"]))),
+                Metric("Period Earnings", format_money(int(payload["totals"]["current_period_earnings"]))),
+                Metric("Ending Equity", format_money(int(payload["totals"]["ending_equity"]))),
+            ]
+            sections = [TableSection("Equity Rollforward", ["component", "title", "amount_cents"], payload["rows"], "No equity activity.")]
         else:
             metrics = [Metric("Accounts", str(len(payload["rows"])))]
             sections = [

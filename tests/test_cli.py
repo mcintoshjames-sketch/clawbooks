@@ -18,7 +18,7 @@ from clawbooks.models import (
     ReconciliationSession,
     SettlementApplication,
 )
-from clawbooks.schemas import StripeEvent
+from clawbooks.schemas import StripeEvent, StripeFetchResult, StripeUnsupportedEvent
 from clawbooks.utils import utcnow
 
 runner = CliRunner()
@@ -853,8 +853,10 @@ def test_owner_paid_expense_hits_owner_contributions(tmp_path: Path) -> None:
     assert result.exit_code == 0
     equity = invoke(ledger, "report", "owner-equity", "--as-of", "2026-04-30")
     body = payload(equity)
-    rows = {row["code"]: row["amount_cents"] for row in body["data"]["rows"]}
-    assert rows["3000"] == 12500
+    rows = {row["component"]: row["amount_cents"] for row in body["data"]["rows"]}
+    assert rows["owner_contributions"] == 12500
+    assert rows["current_period_earnings"] == -12500
+    assert rows["ending_equity"] == 0
 
 
 def test_review_blockers_block_close_until_resolved_then_reopen_unlocks(tmp_path: Path, monkeypatch) -> None:
@@ -1438,3 +1440,439 @@ def test_review_override_posts_once_and_rerun_honors_resolution(tmp_path: Path, 
     with session_scope(ledger) as session:
         count = session.scalar(select(func.count(JournalEntry.id)).where(JournalEntry.source_ref.like("btx_override%")))
         assert count == 1
+
+
+def test_period_close_requires_reconciliation_for_dormant_financial_balances(tmp_path: Path) -> None:
+    ledger = init_ledger(tmp_path)
+    assert invoke(
+        ledger,
+        "journal",
+        "add",
+        "--date",
+        "2026-03-31",
+        "--description",
+        "Opening bank balance",
+        "--source-type",
+        "owner_contribution",
+        "--line",
+        "1000:500.00",
+        "--line",
+        "3000:-500.00",
+    ).exit_code == 0
+
+    close_fail = invoke(
+        ledger,
+        "period",
+        "close",
+        "--period-start",
+        "2026-04-01",
+        "--period-end",
+        "2026-04-30",
+    )
+    body = payload(close_fail)
+    assert close_fail.exit_code == 3
+    assert "1000" in body["errors"][0] or "1000" in json.dumps(body["data"])
+
+
+def test_reconciliation_summary_includes_spanning_session_used_for_close(tmp_path: Path) -> None:
+    ledger = init_ledger(tmp_path)
+    assert invoke(
+        ledger,
+        "journal",
+        "add",
+        "--date",
+        "2026-03-31",
+        "--description",
+        "Opening bank balance",
+        "--source-type",
+        "owner_contribution",
+        "--line",
+        "1000:500.00",
+        "--line",
+        "3000:-500.00",
+    ).exit_code == 0
+    assert invoke(
+        ledger,
+        "journal",
+        "add",
+        "--date",
+        "2026-04-10",
+        "--description",
+        "April expense",
+        "--line",
+        "5110:20.00",
+        "--line",
+        "1000:-20.00",
+    ).exit_code == 0
+
+    statement = write_text(
+        tmp_path / "spanning.csv",
+        "date,description,amount,external_ref\n2026-04-10,Expense,-20.00,span-1\n",
+    )
+    started = invoke(
+        ledger,
+        "reconcile",
+        "start",
+        "--account-code",
+        "1000",
+        "--statement-path",
+        str(statement),
+        "--statement-start",
+        "2026-04-01",
+        "--statement-end",
+        "2026-05-31",
+        "--statement-starting-balance",
+        "500.00",
+        "--statement-ending-balance",
+        "480.00",
+    )
+    session_id = payload(started)["data"]["session_id"]
+    with session_scope(ledger) as session:
+        statement_line_id = session.scalar(select(ReconciliationLine.id).where(ReconciliationLine.session_id == session_id))
+    candidates = payload(invoke(ledger, "reconcile", "candidates", "--session-id", str(session_id)))["data"]["rows"]
+    candidate = next(row for row in candidates if row["amount_cents"] == -2000)
+    assert invoke(
+        ledger,
+        "reconcile",
+        "match",
+        "--session-id",
+        str(session_id),
+        "--line-id",
+        str(statement_line_id),
+        "--journal-line-id",
+        str(candidate["journal_line_id"]),
+        "--amount",
+        "20.00",
+    ).exit_code == 0
+    assert invoke(ledger, "reconcile", "close", "--session-id", str(session_id)).exit_code == 0
+    assert invoke(
+        ledger,
+        "period",
+        "close",
+        "--period-start",
+        "2026-04-01",
+        "--period-end",
+        "2026-04-30",
+    ).exit_code == 0
+
+    summary = payload(
+        invoke(
+            ledger,
+            "report",
+            "general-ledger",
+            "--period-start",
+            "2026-04-01",
+            "--period-end",
+            "2026-04-30",
+        )
+    )
+    assert summary["ok"] is True
+    audit = payload(
+        invoke(
+            ledger,
+            "period",
+            "audit",
+            "--period-start",
+            "2026-04-01",
+            "--period-end",
+            "2026-04-30",
+        )
+    )
+    coverage = audit["data"]["reconciliation_coverage"]
+    assert any(row["session_id"] == session_id for row in coverage["sessions"])
+    bank_row = next(row for row in coverage["coverage_rows"] if row["account_code"] == "1000")
+    assert bank_row["covered"] is True
+    assert session_id in bank_row["session_ids"]
+
+
+def test_import_stripe_blocks_unsupported_events_instead_of_dropping(tmp_path: Path, monkeypatch) -> None:
+    ledger = init_ledger(tmp_path)
+
+    def fake_fetch(_api_key, _start, _end, timezone_name=None):
+        return StripeFetchResult(
+            supported_events=[],
+            unsupported_events=[
+                StripeUnsupportedEvent(
+                    external_id="btx_eur_1",
+                    occurred_at=datetime(2026, 4, 12, 12, 0, tzinfo=UTC),
+                    raw_type="charge",
+                    currency="EUR",
+                    description="EUR subscription",
+                    reason="Stripe balance transaction uses unsupported currency EUR.",
+                    payload={"id": "btx_eur_1", "type": "charge", "currency": "eur"},
+                )
+            ],
+        )
+
+    monkeypatch.setattr("clawbooks.ledger.fetch_stripe_events", fake_fetch)
+    imported = invoke(ledger, "import", "stripe", "--from-date", "2026-04-01", "--to-date", "2026-04-30")
+    body = payload(imported)
+    assert imported.exit_code == 0
+    assert body["data"]["blocked_events"] == 1
+    assert body["data"]["unsupported_events"] == 1
+
+    blockers = payload(invoke(ledger, "review", "list", "--status", "open"))
+    assert blockers["data"]["rows"][0]["blocker_type"] == "stripe_unsupported_event"
+    with session_scope(ledger) as session:
+        assert session.scalar(select(func.count(ExternalEvent.id)).where(ExternalEvent.external_id == "btx_eur_1")) == 1
+
+
+def test_reimbursable_owner_payment_auto_links_only_single_exact_source(tmp_path: Path) -> None:
+    ledger = init_ledger(tmp_path)
+    assert invoke(
+        ledger,
+        "expense",
+        "record",
+        "--date",
+        "2026-04-01",
+        "--vendor",
+        "Legal filing",
+        "--amount",
+        "100.00",
+        "--category",
+        "5140",
+        "--paid-personally",
+        "--reimbursement",
+    ).exit_code == 0
+    assert invoke(
+        ledger,
+        "journal",
+        "add",
+        "--date",
+        "2026-04-20",
+        "--description",
+        "Owner reimbursement",
+        "--line",
+        "2300:100.00",
+        "--line",
+        "1000:-100.00",
+    ).exit_code == 0
+
+    cash = payload(
+        invoke(
+            ledger,
+            "report",
+            "pnl",
+            "--period-start",
+            "2026-04-01",
+            "--period-end",
+            "2026-04-30",
+            "--basis",
+            "cash",
+        )
+    )
+    assert cash["data"]["totals"]["expense_cents"] == 10000
+    assert cash["data"]["excluded_lines"] == []
+    with session_scope(ledger) as session:
+        assert session.scalar(
+            select(func.count(SettlementApplication.id)).where(SettlementApplication.application_type == "reimbursement_auto")
+        ) == 1
+
+
+def test_reimbursable_owner_payment_requires_manual_settlement_when_multiple_sources_exist(tmp_path: Path) -> None:
+    ledger = init_ledger(tmp_path)
+    for entry_date, vendor in (("2026-03-30", "March filing"), ("2026-04-01", "April filing")):
+        assert invoke(
+            ledger,
+            "expense",
+            "record",
+            "--date",
+            entry_date,
+            "--vendor",
+            vendor,
+            "--amount",
+            "100.00",
+            "--category",
+            "5140",
+            "--paid-personally",
+            "--reimbursement",
+        ).exit_code == 0
+    assert invoke(
+        ledger,
+        "journal",
+        "add",
+        "--date",
+        "2026-04-20",
+        "--description",
+        "Owner reimbursement",
+        "--line",
+        "2300:100.00",
+        "--line",
+        "1000:-100.00",
+    ).exit_code == 0
+
+    cash = payload(
+        invoke(
+            ledger,
+            "report",
+            "pnl",
+            "--period-start",
+            "2026-04-01",
+            "--period-end",
+            "2026-04-30",
+            "--basis",
+            "cash",
+        )
+    )
+    assert cash["data"]["totals"]["expense_cents"] == 0
+    assert any("reimbursement" in row["reason"].lower() for row in cash["data"]["excluded_lines"])
+    with session_scope(ledger) as session:
+        assert session.scalar(
+            select(func.count(SettlementApplication.id)).where(SettlementApplication.application_type == "reimbursement_auto")
+        ) == 0
+
+
+def test_equity_rollforward_classifies_manual_equity_postings_as_other_adjustments(tmp_path: Path) -> None:
+    ledger = init_ledger(tmp_path)
+    assert invoke(
+        ledger,
+        "journal",
+        "add",
+        "--date",
+        "2026-01-02",
+        "--description",
+        "Initial capital",
+        "--source-type",
+        "owner_contribution",
+        "--line",
+        "1000:500.00",
+        "--line",
+        "3000:-500.00",
+    ).exit_code == 0
+    assert invoke(
+        ledger,
+        "journal",
+        "add",
+        "--date",
+        "2026-04-10",
+        "--description",
+        "CPA equity cleanup",
+        "--line",
+        "1000:40.00",
+        "--line",
+        "3000:-40.00",
+    ).exit_code == 0
+
+    rollforward = payload(
+        invoke(
+            ledger,
+            "report",
+            "equity-rollforward",
+            "--period-start",
+            "2026-01-01",
+            "--period-end",
+            "2026-04-30",
+        )
+    )
+    rows = {row["component"]: row["amount_cents"] for row in rollforward["data"]["rows"]}
+    assert rows["owner_contributions"] == 50000
+    assert rows["other_equity_adjustments"] == 4000
+
+
+def test_compliance_profile_update_persists_sales_tax_payment_slots(tmp_path: Path) -> None:
+    ledger = init_ledger(tmp_path)
+    updated = invoke(
+        ledger,
+        "compliance",
+        "profile",
+        "update",
+        "--json",
+        json.dumps(
+            {
+                "sales_tax_profile_confirmed": True,
+                "sales_tax_registrations": [
+                    {"jurisdiction": "illinois", "filing_cadence": "annual", "active": True}
+                ],
+                "sales_tax_payment_slots": [
+                    {
+                        "jurisdiction": "illinois",
+                        "period_start": "2026-01-01",
+                        "period_end": "2026-12-31",
+                        "filing_due_date": "2027-01-20",
+                        "payment_expected": "true",
+                        "source": "operator",
+                        "reason": "Annual return payment expected",
+                    }
+                ],
+            }
+        ),
+    )
+    assert updated.exit_code == 0, updated.stdout
+
+    shown = payload(invoke(ledger, "compliance", "profile", "show"))
+    slots = shown["data"]["profile"]["sales_tax_payment_slots"]
+    assert slots == [
+        {
+            "filing_due_date": "2027-01-20",
+            "jurisdiction": "illinois",
+            "payment_expected": "true",
+            "period_end": "2026-12-31",
+            "period_start": "2026-01-01",
+            "reason": "Annual return payment expected",
+            "source": "operator",
+        }
+    ]
+
+    checklist = payload(invoke(ledger, "document", "checklist", "--year", "2026"))
+    rows = {row["item_key"]: row for row in checklist["data"]["rows"]}
+    assert rows["sales_tax_payments"]["status"] == "missing"
+    assert rows["sales_tax_payments"]["slot_details"][0]["payment_expected"] == "true"
+
+
+def test_sales_tax_slot_set_payment_expectation_round_trips(tmp_path: Path) -> None:
+    ledger = init_ledger(tmp_path)
+    assert invoke(
+        ledger,
+        "compliance",
+        "profile",
+        "update",
+        "--json",
+        json.dumps(
+            {
+                "sales_tax_profile_confirmed": True,
+                "sales_tax_registrations": [
+                    {"jurisdiction": "illinois", "filing_cadence": "annual", "active": True}
+                ],
+            }
+        ),
+    ).exit_code == 0
+
+    updated = invoke(
+        ledger,
+        "compliance",
+        "sales-tax-slot",
+        "set-payment-expectation",
+        "--jurisdiction",
+        "illinois",
+        "--period-start",
+        "2026-01-01",
+        "--period-end",
+        "2026-12-31",
+        "--filing-due-date",
+        "2027-01-20",
+        "--payment-expected",
+        "true",
+        "--source",
+        "operator",
+        "--reason",
+        "Annual filing payment expected",
+    )
+    assert updated.exit_code == 0, updated.stdout
+
+    listed = payload(invoke(ledger, "compliance", "sales-tax-slot", "list", "--year", "2026"))
+    assert listed["data"]["rows"] == [
+        {
+            "filing_due_date": "2027-01-20",
+            "jurisdiction": "illinois",
+            "payment_expected": "true",
+            "period_end": "2026-12-31",
+            "period_start": "2026-01-01",
+            "reason": "Annual filing payment expected",
+            "source": "operator",
+        }
+    ]
+
+    checklist = payload(invoke(ledger, "document", "checklist", "--year", "2026"))
+    rows = {row["item_key"]: row for row in checklist["data"]["rows"]}
+    assert rows["sales_tax_payments"]["status"] == "missing"
+    assert rows["sales_tax_payments"]["slot_details"][0]["payment_expected"] == "true"

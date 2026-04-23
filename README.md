@@ -32,8 +32,34 @@ If you omit `--ledger`, the app opens a directory picker and only accepts folder
 
 The TUI is intentionally limited:
 - it can review reports, status, compliance profile, review blockers, and packet checklist state
+- it includes an `Audit` pane for integrity findings, period close-readiness, and close-snapshot drift
 - it can add documents and generate export bundles
 - bookkeeping, imports, settlement, reconciliation, and blocker resolution stay CLI-first
+- if a ledger is not at the current Alembic head, the TUI shows a migration-required screen instead of opening normally
+
+## Integrity and Migration
+
+Check whether a ledger is structurally clean:
+
+```bash
+uv run clawbooks --ledger ./demo doctor
+```
+
+Inspect close readiness and close-snapshot drift for a specific window:
+
+```bash
+uv run clawbooks --ledger ./demo period audit \
+  --period-start 2026-04-01 \
+  --period-end 2026-04-30
+```
+
+If a ledger was created before Alembic-enforced schema management, migrate it explicitly:
+
+```bash
+uv run clawbooks --ledger ./demo migrate
+```
+
+Normal commands now require the ledger DB to be at the current Alembic head; schema drift is no longer repaired implicitly on open.
 
 ## Key Policies
 
@@ -42,10 +68,13 @@ The TUI is intentionally limited:
 - Immediate-cash entries cannot also be reused as settlement cash for prior accruals.
 - Unsupported or invalid cash-basis cases are excluded and surfaced in warnings.
 - Stripe tax ambiguity creates review blockers instead of silent postings.
+- Unsupported Stripe currencies and unsupported balance-transaction types create review blockers instead of being dropped.
 - Open Stripe blockers can be retried against refreshed Stripe facts without losing prior payload history.
 - Reconciliation uses statement-line to journal-line amount applications, not entry-level matching, and mistaken sessions are retired with `reconcile void`.
 - Period close accepts continuous coverage from chained closed sessions; it does not require one oversized spanning reconciliation.
 - Period close freezes settlement and reconciliation mutations for the closed window until `period reopen` is recorded.
+- Exact one-source owner reimbursements auto-link into cash-basis settlement; ambiguous reimbursement clearing stays manual.
+- `report owner-equity` is now a compatibility alias to the full `equity-rollforward` report.
 - Accountant packets are advisory handoff bundles, not filing-ready returns.
 
 ## Accountant Packet
@@ -56,7 +85,8 @@ Add support documents:
 uv run clawbooks --ledger ./demo document add \
   --source-path /path/to/stripe-1099-k.pdf \
   --type stripe_1099_k \
-  --year 2026
+  --year 2026 \
+  --jurisdiction illinois
 ```
 
 Inspect advisory packet status:
@@ -77,3 +107,8 @@ The export writes `exports/accountant-packet_YYYY/` plus a sibling `.zip`, inclu
 - compliance-profile snapshot
 - advisory checklist and missing/unknown items
 - unsupported cash-basis warning snapshot
+
+For cadence-sensitive tax support:
+- estimated-tax confirmations must carry exact filing-period metadata
+- sales-tax returns/payments are matched by jurisdiction plus exact filing slot
+- sales-tax payment completeness stays `unknown` until explicit slot expectations are recorded with `compliance sales-tax-slot ...`

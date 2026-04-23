@@ -6,7 +6,7 @@ from zoneinfo import ZoneInfo
 import stripe
 
 from clawbooks.exceptions import ComplianceError
-from clawbooks.schemas import StripeEvent
+from clawbooks.schemas import StripeEvent, StripeFetchResult, StripeUnsupportedEvent
 
 
 def _to_epoch_bounds(start: date, end: date, *, timezone_name: str) -> tuple[int, int]:
@@ -25,12 +25,48 @@ def _extract_tax_amount(charge: object) -> int | None:
     return None
 
 
-def _balance_transaction_to_event(item: object) -> StripeEvent | None:
+def _balance_transaction_payload(item: object) -> dict:
+    if hasattr(item, "to_dict_recursive"):
+        return item.to_dict_recursive()
+    return {
+        "id": getattr(item, "id", None),
+        "created": getattr(item, "created", None),
+        "type": getattr(item, "type", None),
+        "currency": getattr(item, "currency", None),
+        "amount": getattr(item, "amount", None),
+        "fee": getattr(item, "fee", None),
+        "net": getattr(item, "net", None),
+        "source": getattr(item, "source", None),
+        "description": getattr(item, "description", None),
+    }
+
+
+def _unsupported_balance_transaction(item: object, *, reason: str) -> StripeUnsupportedEvent:
     occurred_at = datetime.fromtimestamp(item.created, tz=UTC)
     item_type = str(item.type)
     source_id = str(item.source) if getattr(item, "source", None) else item.id
-    if item.currency.lower() != "usd":
-        return None
+    return StripeUnsupportedEvent(
+        external_id=item.id,
+        occurred_at=occurred_at,
+        raw_type=item_type,
+        currency=str(getattr(item, "currency", "") or "").upper(),
+        description=getattr(item, "description", "") or "",
+        reason=reason,
+        source_id=source_id,
+        payload=_balance_transaction_payload(item),
+    )
+
+
+def _balance_transaction_to_payload(item: object) -> StripeEvent | StripeUnsupportedEvent:
+    occurred_at = datetime.fromtimestamp(item.created, tz=UTC)
+    item_type = str(item.type)
+    source_id = str(item.source) if getattr(item, "source", None) else item.id
+    currency = str(getattr(item, "currency", "") or "").lower()
+    if currency != "usd":
+        return _unsupported_balance_transaction(
+            item,
+            reason=f"Stripe balance transaction uses unsupported currency {currency.upper() or 'UNKNOWN'}.",
+        )
 
     if item_type == "charge":
         charge = None
@@ -82,10 +118,13 @@ def _balance_transaction_to_event(item: object) -> StripeEvent | None:
             description=getattr(item, "description", "") or "",
             payout_id=source_id,
         )
-    return None
+    return _unsupported_balance_transaction(
+        item,
+        reason=f"Stripe balance transaction type {item_type} is not supported for automatic posting.",
+    )
 
 
-def fetch_stripe_events(api_key: str | None, start: date, end: date, *, timezone_name: str) -> list[StripeEvent]:
+def fetch_stripe_events(api_key: str | None, start: date, end: date, *, timezone_name: str) -> StripeFetchResult:
     if not api_key:
         raise ComplianceError("Missing Stripe API key. Set CLAWBOOKS_STRIPE_API_KEY to import Stripe activity.")
 
@@ -96,22 +135,25 @@ def fetch_stripe_events(api_key: str | None, start: date, end: date, *, timezone
         limit=100,
     )
 
-    events: list[StripeEvent] = []
+    supported_events: list[StripeEvent] = []
+    unsupported_events: list[StripeUnsupportedEvent] = []
     for item in raw_events.auto_paging_iter():
-        event = _balance_transaction_to_event(item)
-        if event is not None:
-            events.append(event)
+        payload = _balance_transaction_to_payload(item)
+        if isinstance(payload, StripeUnsupportedEvent):
+            unsupported_events.append(payload)
+        else:
+            supported_events.append(payload)
 
-    return events
+    return StripeFetchResult(
+        supported_events=supported_events,
+        unsupported_events=unsupported_events,
+    )
 
 
-def fetch_stripe_event(api_key: str | None, external_id: str) -> StripeEvent:
+def fetch_stripe_event(api_key: str | None, external_id: str) -> StripeEvent | StripeUnsupportedEvent:
     if not api_key:
         raise ComplianceError("Missing Stripe API key. Set CLAWBOOKS_STRIPE_API_KEY to import Stripe activity.")
 
     stripe.api_key = api_key
     item = stripe.BalanceTransaction.retrieve(external_id)
-    event = _balance_transaction_to_event(item)
-    if event is None:
-        raise ComplianceError(f"Stripe event {external_id} is not a supported USD balance transaction.")
-    return event
+    return _balance_transaction_to_payload(item)

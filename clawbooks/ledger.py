@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import re
 import shutil
+from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from pathlib import Path
@@ -16,6 +17,7 @@ from clawbooks.exceptions import ComplianceError, ImportConflictError, LockedPer
 from clawbooks.models import (
     Account,
     Attachment,
+    AuditEvent,
     Document,
     DocumentLink,
     ExternalEvent,
@@ -33,14 +35,22 @@ from clawbooks.models import (
     SettlementApplication,
     TaxObligation,
 )
-from clawbooks.schemas import AppConfig, CSVImportProfile, ComplianceProfile, StripeEvent
+from clawbooks.schemas import (
+    AppConfig,
+    CSVImportProfile,
+    ComplianceProfile,
+    SalesTaxPaymentSlot,
+    StripeEvent,
+    StripeFetchResult,
+    StripeUnsupportedEvent,
+)
 from clawbooks.stripe_client import fetch_stripe_event, fetch_stripe_events
-from clawbooks.utils import parse_date, parse_money, read_csv_rows, sha256_for_path, stable_external_id, utcnow
+from clawbooks.utils import json_dumps, parse_date, parse_money, read_csv_rows, sha256_for_path, stable_external_id, utcnow
 
 ACCOUNT_KINDS = {"asset", "liability", "equity", "revenue", "expense", "contra_revenue"}
 FINANCIAL_SUBTYPES = {"bank", "card", "stripe_clearing"}
 P_AND_L_KINDS = {"revenue", "expense", "contra_revenue"}
-SETTLEMENT_APPLICATION_TYPES = {"manual", "cash_receipt", "cash_disbursement", "owner_paid"}
+SETTLEMENT_APPLICATION_TYPES = {"manual", "cash_receipt", "cash_disbursement", "owner_paid", "reimbursement_auto"}
 DOCUMENT_SCOPES = {"business", "owner"}
 STATEMENT_DOCUMENT_TYPES = {
     "bank": "bank_statement",
@@ -65,6 +75,7 @@ DOCUMENT_TYPES = {
     "tax_notice",
 }
 REVIEW_RESOLUTION_TYPES = {"skip", "post_with_override", "superseded_by_manual_entry"}
+MANUAL_SOURCE_TYPES = {"manual", "owner_contribution", "owner_draw"}
 UNSET = object()
 
 
@@ -78,6 +89,21 @@ class JournalLineInput:
 def _sanitize_document_filename(name: str) -> str:
     cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", name).strip("._")
     return cleaned or "document"
+
+
+def _normalize_jurisdiction(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = re.sub(r"\s+", "_", value.strip().lower())
+    aliases = {
+        "il": "illinois",
+        "ill": "illinois",
+        "irs": "federal",
+        "us": "federal",
+        "usa": "federal",
+    }
+    normalized = aliases.get(normalized, normalized)
+    return normalized or None
 
 
 def _document_relative_path(*, document_type: str, tax_year: int, source_path: Path, sha256: str) -> Path:
@@ -118,6 +144,7 @@ def _validate_document_metadata(
     *,
     document_type: str,
     tax_year: int,
+    jurisdiction: str | None,
     scope: str,
     period_start: date | None,
     period_end: date | None,
@@ -130,6 +157,8 @@ def _validate_document_metadata(
         raise ValidationError(f"Invalid tax year: {tax_year}")
     if period_start and period_end and period_start > period_end:
         raise ValidationError("Document period start cannot be after period end")
+    if jurisdiction is not None and not _normalize_jurisdiction(jurisdiction):
+        raise ValidationError("Document jurisdiction cannot be blank")
 
 
 def _resolve_document_targets(
@@ -174,6 +203,7 @@ def _document_payload(document: Document) -> dict[str, object]:
         "document_id": document.id,
         "document_type": document.document_type,
         "tax_year": document.tax_year,
+        "jurisdiction": document.jurisdiction,
         "period_start": document.period_start,
         "period_end": document.period_end,
         "scope": document.scope,
@@ -190,6 +220,31 @@ def _document_payload(document: Document) -> dict[str, object]:
 
 def serialize_document(document: Document) -> dict[str, object]:
     return _document_payload(document)
+
+
+def _record_audit_event(
+    session: Session,
+    *,
+    entity_type: str,
+    entity_ref: str,
+    action: str,
+    before: dict[str, object] | None,
+    after: dict[str, object] | None,
+    source: str,
+    reason: str | None = None,
+) -> None:
+    session.add(
+        AuditEvent(
+            entity_type=entity_type,
+            entity_ref=entity_ref,
+            action=action,
+            before_json=None if before is None else json_dumps(before),
+            after_json=None if after is None else json_dumps(after),
+            source=source,
+            reason=reason,
+            created_at=utcnow(),
+        )
+    )
 
 
 def _apply_document_links(document: Document, targets: list[tuple[str, int]], *, clear_links: bool) -> None:
@@ -210,6 +265,7 @@ def create_document(
     source_path: Path,
     document_type: str,
     tax_year: int,
+    jurisdiction: str | None = None,
     scope: str,
     period_start: date | None = None,
     period_end: date | None = None,
@@ -224,6 +280,7 @@ def create_document(
     _validate_document_metadata(
         document_type=document_type,
         tax_year=tax_year,
+        jurisdiction=jurisdiction,
         scope=scope,
         period_start=period_start,
         period_end=period_end,
@@ -245,6 +302,7 @@ def create_document(
     document = Document(
         document_type=document_type,
         tax_year=tax_year,
+        jurisdiction=_normalize_jurisdiction(jurisdiction),
         period_start=period_start,
         period_end=period_end,
         scope=scope,
@@ -259,7 +317,17 @@ def create_document(
     session.flush()
     _apply_document_links(document, targets, clear_links=False)
     session.flush()
-    return session.scalar(select(Document).options(selectinload(Document.links)).where(Document.id == document.id))
+    created = session.scalar(select(Document).options(selectinload(Document.links)).where(Document.id == document.id))
+    _record_audit_event(
+        session,
+        entity_type="document",
+        entity_ref=str(created.id),
+        action="create",
+        before=None,
+        after=_document_payload(created),
+        source=created_via,
+    )
+    return created
 
 
 def list_documents(
@@ -305,6 +373,7 @@ def update_document(
     document_id: int,
     document_type: str | None = None,
     tax_year: int | None = None,
+    jurisdiction: str | object = UNSET,
     scope: str | None = None,
     period_start: date | object = UNSET,
     period_end: date | object = UNSET,
@@ -320,11 +389,14 @@ def update_document(
     document = session.scalar(select(Document).options(selectinload(Document.links)).where(Document.id == document_id))
     if not document:
         raise ValidationError(f"Unknown document: {document_id}")
+    before_payload = _document_payload(document)
 
     if document_type is not None:
         document.document_type = document_type
     if tax_year is not None:
         document.tax_year = tax_year
+    if jurisdiction is not UNSET:
+        document.jurisdiction = _normalize_jurisdiction(jurisdiction)
     if scope is not None:
         document.scope = scope
     if clear_period:
@@ -343,6 +415,7 @@ def update_document(
     _validate_document_metadata(
         document_type=document.document_type,
         tax_year=document.tax_year,
+        jurisdiction=document.jurisdiction,
         scope=document.scope,
         period_start=document.period_start,
         period_end=document.period_end,
@@ -357,7 +430,17 @@ def update_document(
     if clear_links or targets:
         _apply_document_links(document, targets, clear_links=clear_links)
     session.flush()
-    return session.scalar(select(Document).options(selectinload(Document.links)).where(Document.id == document.id))
+    updated = session.scalar(select(Document).options(selectinload(Document.links)).where(Document.id == document.id))
+    _record_audit_event(
+        session,
+        entity_type="document",
+        entity_ref=str(updated.id),
+        action="update",
+        before=before_payload,
+        after=_document_payload(updated),
+        source="cli",
+    )
+    return updated
 
 
 def _get_setting_json(session: Session, key: str, default: dict[str, object]) -> dict[str, object]:
@@ -370,20 +453,99 @@ def _get_setting_json(session: Session, key: str, default: dict[str, object]) ->
 def _set_setting_json(session: Session, key: str, value: dict[str, object]) -> None:
     setting = session.get(Setting, key)
     if setting:
-        setting.value_json = json.dumps(value, sort_keys=True)
+        setting.value_json = json_dumps(value)
     else:
-        session.add(Setting(key=key, value_json=json.dumps(value, sort_keys=True)))
+        session.add(Setting(key=key, value_json=json_dumps(value)))
     session.flush()
 
 
 def get_compliance_profile(session: Session) -> ComplianceProfile:
-    raw = _get_setting_json(session, "compliance_profile", ComplianceProfile().model_dump())
+    raw = _get_setting_json(session, "compliance_profile", ComplianceProfile().model_dump(mode="json"))
     return ComplianceProfile.model_validate(raw)
 
 
-def set_compliance_profile(session: Session, profile: ComplianceProfile) -> ComplianceProfile:
-    _set_setting_json(session, "compliance_profile", profile.model_dump())
-    return get_compliance_profile(session)
+def set_compliance_profile(
+    session: Session,
+    profile: ComplianceProfile,
+    *,
+    source: str = "cli",
+    reason: str | None = None,
+) -> ComplianceProfile:
+    before = get_compliance_profile(session).model_dump()
+    _set_setting_json(session, "compliance_profile", profile.model_dump(mode="json"))
+    updated = get_compliance_profile(session)
+    _record_audit_event(
+        session,
+        entity_type="compliance_profile",
+        entity_ref="default",
+        action="update",
+        before=before,
+        after=updated.model_dump(),
+        source=source,
+        reason=reason,
+    )
+    return updated
+
+
+def _sales_tax_slot_key(slot: SalesTaxPaymentSlot) -> tuple[str, date, date, date]:
+    return (_normalize_jurisdiction(slot.jurisdiction) or "", slot.period_start, slot.period_end, slot.filing_due_date)
+
+
+def list_sales_tax_payment_slots(session: Session, *, year: int | None = None) -> dict[str, object]:
+    profile = get_compliance_profile(session)
+    slots = [
+        slot
+        for slot in profile.sales_tax_payment_slots
+        if year is None or slot.period_start.year == year or slot.period_end.year == year or slot.filing_due_date.year == year
+    ]
+    rows = [
+        {
+            "jurisdiction": slot.jurisdiction,
+            "period_start": slot.period_start,
+            "period_end": slot.period_end,
+            "filing_due_date": slot.filing_due_date,
+            "payment_expected": slot.payment_expected,
+            "source": slot.source,
+            "reason": slot.reason,
+        }
+        for slot in sorted(slots, key=_sales_tax_slot_key)
+    ]
+    return {"rows": rows}
+
+
+def set_sales_tax_payment_expectation(
+    session: Session,
+    *,
+    jurisdiction: str,
+    period_start: date,
+    period_end: date,
+    filing_due_date: date,
+    payment_expected: str,
+    source: str | None = None,
+    reason: str | None = None,
+) -> ComplianceProfile:
+    if period_start > period_end:
+        raise ValidationError("Sales-tax slot period start cannot be after period end")
+    if payment_expected not in {"true", "false", "unknown"}:
+        raise ValidationError("Sales-tax slot payment expectation must be true, false, or unknown")
+    normalized_jurisdiction = _normalize_jurisdiction(jurisdiction)
+    if normalized_jurisdiction is None:
+        raise ValidationError("Sales-tax slot jurisdiction is required")
+    profile = get_compliance_profile(session)
+    slots = [slot for slot in profile.sales_tax_payment_slots if _sales_tax_slot_key(slot) != (normalized_jurisdiction, period_start, period_end, filing_due_date)]
+    slots.append(
+        SalesTaxPaymentSlot(
+            jurisdiction=normalized_jurisdiction,
+            period_start=period_start,
+            period_end=period_end,
+            filing_due_date=filing_due_date,
+            payment_expected=payment_expected,
+            source=source,
+            reason=reason,
+        )
+    )
+    updated = profile.model_copy(update={"sales_tax_payment_slots": sorted(slots, key=_sales_tax_slot_key)})
+    return set_compliance_profile(session, updated, source="cli", reason="sales-tax-slot update")
 
 
 def seed_defaults(session: Session, year: int) -> None:
@@ -405,7 +567,7 @@ def seed_defaults(session: Session, year: int) -> None:
     if not session.get(Setting, "ledger_version"):
         session.add(Setting(key="ledger_version", value_json=json.dumps({"version": 2})))
     if not session.get(Setting, "compliance_profile"):
-        session.add(Setting(key="compliance_profile", value_json=json.dumps(ComplianceProfile().model_dump(), sort_keys=True)))
+        session.add(Setting(key="compliance_profile", value_json=json_dumps(ComplianceProfile().model_dump(mode="json"))))
 
 
 def list_accounts(session: Session, *, include_inactive: bool = False) -> list[Account]:
@@ -528,6 +690,8 @@ def post_journal_entry(
     ensure_unlocked(session, entry_date)
     if not lines:
         raise ValidationError("Journal entry must include at least one line")
+    if source_type in MANUAL_SOURCE_TYPES:
+        _validate_manual_source_type(session, lines=lines, source_type=source_type)
     total = sum(line.amount_cents for line in lines)
     if total != 0:
         raise ValidationError("Journal entry is not balanced", data={"difference_cents": total})
@@ -556,10 +720,107 @@ def post_journal_entry(
         )
 
     session.flush()
+    created = session.scalar(
+        select(JournalEntry)
+        .options(selectinload(JournalEntry.lines).selectinload(JournalLine.account))
+        .where(JournalEntry.id == entry.id)
+    )
+    if created is None:
+        raise ValidationError("Failed to load newly-created journal entry")
+    _maybe_auto_apply_reimbursement_settlement(session, created)
     return session.scalar(
         select(JournalEntry)
         .options(selectinload(JournalEntry.lines).selectinload(JournalLine.account))
         .where(JournalEntry.id == entry.id)
+    )
+
+
+def _validate_manual_source_type(session: Session, *, lines: list[JournalLineInput], source_type: str) -> None:
+    if source_type == "manual":
+        return
+    resolved = [(line, get_account(session, line.account_code)) for line in lines]
+    has_p_and_l = any(account.kind in P_AND_L_KINDS for _line, account in resolved)
+    account_codes = {account.code for _line, account in resolved}
+    if source_type == "owner_contribution":
+        if "3000" not in account_codes:
+            raise ValidationError("owner_contribution entries must include account 3000")
+        if has_p_and_l:
+            raise ValidationError("owner_contribution entries cannot include P&L accounts")
+        equity_amount = sum(line.amount_cents for line, account in resolved if account.code == "3000")
+        if equity_amount >= 0:
+            raise ValidationError("owner_contribution entries must credit account 3000")
+        return
+    if source_type == "owner_draw":
+        if "3100" not in account_codes:
+            raise ValidationError("owner_draw entries must include account 3100")
+        if has_p_and_l:
+            raise ValidationError("owner_draw entries cannot include P&L accounts")
+        draw_amount = sum(line.amount_cents for line, account in resolved if account.code == "3100")
+        if draw_amount <= 0:
+            raise ValidationError("owner_draw entries must debit account 3100")
+        return
+    raise ValidationError(f"Unsupported manual source type: {source_type}")
+
+
+def _is_supported_reimbursable_expense_source_line(line: JournalLine) -> bool:
+    if line.account.kind != "expense":
+        return False
+    entry = line.entry
+    if entry.source_type != "expense":
+        return False
+    if len(entry.lines) != 2:
+        return False
+    companions = [candidate for candidate in entry.lines if candidate.id != line.id]
+    return len(companions) == 1 and companions[0].account.code == "2300"
+
+
+def _maybe_auto_apply_reimbursement_settlement(session: Session, entry: JournalEntry) -> None:
+    if len(entry.lines) != 2:
+        return
+    payable_lines = [line for line in entry.lines if line.account.code == "2300"]
+    cash_lines = [line for line in entry.lines if line.account.code in {"1000", "1010", "2000"}]
+    if len(payable_lines) != 1 or len(cash_lines) != 1:
+        return
+    if any(line.account.kind in P_AND_L_KINDS for line in entry.lines):
+        return
+    payable_line = payable_lines[0]
+    cash_line = cash_lines[0]
+    reimbursement_amount_cents = abs(cash_line.amount_cents)
+    if reimbursement_amount_cents == 0 or payable_line.amount_cents <= 0:
+        return
+
+    candidate_lines = list(
+        session.scalars(
+            select(JournalLine)
+            .join(JournalEntry)
+            .join(Account)
+            .options(
+                selectinload(JournalLine.account),
+                selectinload(JournalLine.entry).selectinload(JournalEntry.lines).selectinload(JournalLine.account),
+            )
+            .where(
+                Account.kind == "expense",
+                JournalEntry.source_type == "expense",
+                JournalEntry.entry_date <= entry.entry_date,
+            )
+        )
+    )
+    eligible: list[JournalLine] = []
+    for source_line in candidate_lines:
+        if not _is_supported_reimbursable_expense_source_line(source_line):
+            continue
+        residual_cents = abs(source_line.amount_cents) - _sum_open_source_applications(session, source_line.id)
+        if residual_cents == reimbursement_amount_cents:
+            eligible.append(source_line)
+    if len(eligible) != 1:
+        return
+    apply_settlement(
+        session,
+        source_line_id=eligible[0].id,
+        settlement_line_id=cash_line.id,
+        amount=f"{reimbursement_amount_cents / 100:.2f}",
+        applied_date=entry.entry_date,
+        application_type="reimbursement_auto",
     )
 
 
@@ -746,8 +1007,11 @@ def _local_date(config: AppConfig, value: datetime) -> date:
     return value.astimezone(ZoneInfo(config.timezone)).date()
 
 
-def _raw_payload_to_event(external_event: ExternalEvent) -> StripeEvent:
-    return StripeEvent.model_validate(json.loads(external_event.payload_json))
+def _raw_payload_to_event(external_event: ExternalEvent) -> StripeEvent | StripeUnsupportedEvent:
+    payload = json.loads(external_event.payload_json)
+    if "reason" in payload and "raw_type" in payload:
+        return StripeUnsupportedEvent.model_validate(payload)
+    return StripeEvent.model_validate(payload)
 
 
 def _find_external_event(session: Session, *, provider: str, external_id: str) -> ExternalEvent | None:
@@ -763,6 +1027,18 @@ def _find_review_blocker(session: Session, *, provider: str, external_id: str, b
             ReviewBlocker.external_id == external_id,
             ReviewBlocker.blocker_type == blocker_type,
         )
+    )
+
+
+def _find_open_stripe_blocker(session: Session, *, external_id: str) -> ReviewBlocker | None:
+    return session.scalar(
+        select(ReviewBlocker)
+        .where(
+            ReviewBlocker.provider == "stripe",
+            ReviewBlocker.external_id == external_id,
+            ReviewBlocker.status == "open",
+        )
+        .order_by(ReviewBlocker.id.desc())
     )
 
 
@@ -1121,6 +1397,28 @@ def _stripe_blocker_reason(config: AppConfig, event: StripeEvent) -> str | None:
     return None
 
 
+def _unsupported_stripe_reason(event: StripeUnsupportedEvent) -> str:
+    return event.reason
+
+
+def _reset_open_blocker(
+    blocker: ReviewBlocker,
+    *,
+    blocker_type: str,
+    blocker_date: date,
+    note: str,
+    external_event_id: int,
+) -> None:
+    blocker.blocker_type = blocker_type
+    blocker.status = "open"
+    blocker.blocker_date = blocker_date
+    blocker.external_event_id = external_event_id
+    blocker.resolution_note = note
+    blocker.resolved_at = None
+    blocker.resolution_type = None
+    blocker.resolution_entry_id = None
+
+
 def _post_stripe_event(
     session: Session,
     *,
@@ -1233,17 +1531,23 @@ def _post_stripe_event(
     return created
 
 
+def _external_payload_event_type(event: StripeEvent | StripeUnsupportedEvent) -> str:
+    if isinstance(event, StripeUnsupportedEvent):
+        return "unsupported_balance_transaction"
+    return event.event_type
+
+
 def _record_external_event(
     session: Session,
     *,
     provider: str,
-    event: StripeEvent,
+    event: StripeEvent | StripeUnsupportedEvent,
     import_run_id: int | None,
     journal_entry_id: int | None,
 ) -> ExternalEvent:
     external_event = _find_external_event(session, provider=provider, external_id=event.external_id)
     if external_event:
-        external_event.event_type = event.event_type
+        external_event.event_type = _external_payload_event_type(event)
         external_event.occurred_at = event.occurred_at
         external_event.payload_json = event.model_dump_json()
         external_event.import_run_id = import_run_id
@@ -1252,7 +1556,7 @@ def _record_external_event(
         external_event = ExternalEvent(
             provider=provider,
             external_id=event.external_id,
-            event_type=event.event_type,
+            event_type=_external_payload_event_type(event),
             occurred_at=event.occurred_at,
             payload_json=event.model_dump_json(),
             import_run_id=import_run_id,
@@ -1267,7 +1571,7 @@ def _refresh_external_event_payload(
     session: Session,
     *,
     external_event: ExternalEvent,
-    event: StripeEvent,
+    event: StripeEvent | StripeUnsupportedEvent,
     import_run_id: int | None,
     refresh_source: str,
     change_note: str | None = None,
@@ -1278,7 +1582,7 @@ def _refresh_external_event_payload(
         refresh_source=refresh_source,
         change_note=change_note,
     )
-    external_event.event_type = event.event_type
+    external_event.event_type = _external_payload_event_type(event)
     external_event.occurred_at = event.occurred_at
     external_event.payload_json = event.model_dump_json()
     external_event.import_run_id = import_run_id
@@ -1286,7 +1590,7 @@ def _refresh_external_event_payload(
     return external_event
 
 
-def _fetch_latest_stripe_event(config: AppConfig, external_id: str) -> StripeEvent:
+def _fetch_latest_stripe_event(config: AppConfig, external_id: str) -> StripeEvent | StripeUnsupportedEvent:
     return fetch_stripe_event(config.stripe_api_key, external_id)
 
 
@@ -1297,7 +1601,7 @@ def _process_open_stripe_blocker(
     import_run: ImportRun | None,
     external_event: ExternalEvent,
     blocker: ReviewBlocker,
-    event: StripeEvent,
+    event: StripeEvent | StripeUnsupportedEvent,
     refresh_source: str,
 ) -> tuple[int, list[str]]:
     warnings: list[str] = []
@@ -1309,15 +1613,28 @@ def _process_open_stripe_blocker(
         refresh_source=refresh_source,
         change_note="Re-evaluating open review blocker against refreshed Stripe facts.",
     )
+    blocker_date = _local_date(config, event.occurred_at)
+    if isinstance(event, StripeUnsupportedEvent):
+        note = _unsupported_stripe_reason(event)
+        _reset_open_blocker(
+            blocker,
+            blocker_type="stripe_unsupported_event",
+            blocker_date=blocker_date,
+            note=note,
+            external_event_id=external_event.id,
+        )
+        session.flush()
+        warnings.append(f"{event.external_id}: {note}")
+        return 0, warnings
     reason = _stripe_blocker_reason(config, event)
     if reason:
-        blocker.status = "open"
-        blocker.blocker_date = _local_date(config, event.occurred_at)
-        blocker.external_event_id = external_event.id
-        blocker.resolution_note = reason
-        blocker.resolved_at = None
-        blocker.resolution_type = None
-        blocker.resolution_entry_id = None
+        _reset_open_blocker(
+            blocker,
+            blocker_type="stripe_tax_review",
+            blocker_date=blocker_date,
+            note=reason,
+            external_event_id=external_event.id,
+        )
         session.flush()
         warnings.append(f"{event.external_id}: {reason}")
         return 0, warnings
@@ -1362,11 +1679,16 @@ def resolve_review_blocker(
     elif resolution_type == "skip":
         _resolve_review_blocker(blocker, resolution_type=resolution_type, note=note)
     else:
+        if blocker.blocker_type == "stripe_unsupported_event":
+            raise ValidationError("post_with_override is not allowed for unsupported Stripe events")
         if not external_event:
             raise ValidationError("Review blocker is missing its external event payload")
+        raw_event = _raw_payload_to_event(external_event)
+        if isinstance(raw_event, StripeUnsupportedEvent):
+            raise ValidationError("Unsupported Stripe events cannot be override-posted")
         if override_tax_cents is None:
             raise ValidationError("--override-tax-cents is required for post_with_override")
-        event = _raw_payload_to_event(external_event).model_copy(update={"tax_cents": override_tax_cents})
+        event = raw_event.model_copy(update={"tax_cents": override_tax_cents})
         entries = _post_stripe_event(session, config=config, import_run=None, event=event, source_ref_suffix="override")
         external_event.journal_entry_id = entries[0].id if entries else None
         _resolve_review_blocker(
@@ -1401,6 +1723,21 @@ def retry_review_blocker(session: Session, *, blocker_id: int, config: AppConfig
     )
     session.flush()
     return {"review_blocker": _serialize_blocker(session, blocker)}, warnings
+
+
+def _coerce_stripe_fetch_result(
+    payload: StripeFetchResult | list[StripeEvent] | list[StripeEvent | StripeUnsupportedEvent],
+) -> StripeFetchResult:
+    if isinstance(payload, StripeFetchResult):
+        return payload
+    supported_events: list[StripeEvent] = []
+    unsupported_events: list[StripeUnsupportedEvent] = []
+    for item in payload:
+        if isinstance(item, StripeUnsupportedEvent):
+            unsupported_events.append(item)
+        else:
+            supported_events.append(item)
+    return StripeFetchResult(supported_events=supported_events, unsupported_events=unsupported_events)
 
 
 def import_csv(
@@ -1592,24 +1929,31 @@ def import_stripe(
     start: date,
     end: date,
     dry_run: bool = False,
-    events: list[StripeEvent] | None = None,
+    events: StripeFetchResult | list[StripeEvent] | list[StripeEvent | StripeUnsupportedEvent] | None = None,
 ) -> tuple[dict[str, object], list[str]]:
     import_run = _start_import_run(session, source="stripe", from_date=start, to_date=end, dry_run=dry_run)
-    stripe_events = events or fetch_stripe_events(config.stripe_api_key, start, end, timezone_name=config.timezone)
+    fetch_result = _coerce_stripe_fetch_result(events) if events is not None else _coerce_stripe_fetch_result(
+        fetch_stripe_events(
+            config.stripe_api_key,
+            start,
+            end,
+            timezone_name=config.timezone,
+        )
+    )
+    stripe_events: list[StripeEvent | StripeUnsupportedEvent] = sorted(
+        [*fetch_result.supported_events, *fetch_result.unsupported_events],
+        key=lambda item: (item.occurred_at, item.external_id),
+    )
     warnings: list[str] = []
     posted = 0
     duplicates = 0
     blocked = 0
+    unsupported = 0
 
     for event in stripe_events:
         existing = _find_external_event(session, provider="stripe", external_id=event.external_id)
         if existing:
-            blocker = _find_review_blocker(
-                session,
-                provider="stripe",
-                external_id=event.external_id,
-                blocker_type="stripe_tax_review",
-            )
+            blocker = _find_open_stripe_blocker(session, external_id=event.external_id)
             if blocker and blocker.status == "open":
                 posted_count, blocker_warnings = _process_open_stripe_blocker(
                     session,
@@ -1623,13 +1967,14 @@ def import_stripe(
                 posted += posted_count
                 if posted_count == 0:
                     blocked += 1
+                    if isinstance(event, StripeUnsupportedEvent):
+                        unsupported += 1
                 warnings.extend(blocker_warnings)
                 continue
             duplicates += 1
             warnings.append(f"Skipped existing Stripe event {event.external_id}")
             continue
 
-        blocker_reason = _stripe_blocker_reason(config, event)
         external_event = _record_external_event(
             session,
             provider="stripe",
@@ -1637,6 +1982,21 @@ def import_stripe(
             import_run_id=import_run.id,
             journal_entry_id=None,
         )
+        if isinstance(event, StripeUnsupportedEvent):
+            blocker = _upsert_review_blocker(
+                session,
+                blocker_type="stripe_unsupported_event",
+                provider="stripe",
+                external_id=event.external_id,
+                blocker_date=_local_date(config, event.occurred_at),
+                note=_unsupported_stripe_reason(event),
+                external_event_id=external_event.id,
+            )
+            blocked += 1
+            unsupported += 1
+            warnings.append(f"{event.external_id}: {blocker.resolution_note}")
+            continue
+        blocker_reason = _stripe_blocker_reason(config, event)
         if blocker_reason:
             blocker = _upsert_review_blocker(
                 session,
@@ -1662,6 +2022,7 @@ def import_stripe(
         "entries_posted": posted,
         "duplicates": duplicates,
         "blocked_events": blocked,
+        "unsupported_events": unsupported,
     }
     _complete_import_run(import_run, warnings=warnings, summary=summary)
     return summary, warnings
@@ -1970,6 +2331,168 @@ def account_balance_as_of(session: Session, *, account_id: int, as_of: date) -> 
     return int(raw or 0)
 
 
+def _financial_account_activity_count(session: Session, *, account_id: int, period_start: date, period_end: date) -> int:
+    count = session.scalar(
+        select(func.count(JournalLine.id))
+        .join(JournalEntry, JournalLine.entry_id == JournalEntry.id)
+        .where(
+            JournalLine.account_id == account_id,
+            JournalEntry.entry_date >= period_start,
+            JournalEntry.entry_date <= period_end,
+        )
+    )
+    return int(count or 0)
+
+
+def reconciliation_required_accounts(
+    session: Session,
+    *,
+    period_start: date,
+    period_end: date,
+) -> list[dict[str, object]]:
+    opening_as_of = period_start - timedelta(days=1)
+    rows: list[dict[str, object]] = []
+    accounts = list(
+        session.scalars(
+            select(Account)
+            .where(Account.subtype.in_(FINANCIAL_SUBTYPES))
+            .order_by(Account.code)
+        )
+    )
+    for account in accounts:
+        opening_raw = account_balance_as_of(session, account_id=account.id, as_of=opening_as_of)
+        closing_raw = account_balance_as_of(session, account_id=account.id, as_of=period_end)
+        activity_count = _financial_account_activity_count(
+            session,
+            account_id=account.id,
+            period_start=period_start,
+            period_end=period_end,
+        )
+        rows.append(
+            {
+                "account_id": account.id,
+                "account_code": account.code,
+                "account_name": account.name,
+                "account_subtype": account.subtype,
+                "opening_balance_cents": display_balance(account, opening_raw),
+                "closing_balance_cents": display_balance(account, closing_raw),
+                "activity_count": activity_count,
+                "required_for_close": bool(opening_raw or closing_raw or activity_count),
+            }
+        )
+    return rows
+
+
+def _merged_reconciliation_ranges(
+    sessions: list[ReconciliationSession],
+    *,
+    period_start: date,
+    period_end: date,
+) -> list[tuple[date, date]]:
+    clipped = [
+        (max(item.statement_start, period_start), min(item.statement_end, period_end))
+        for item in sessions
+        if item.status == "closed" and item.statement_start <= period_end and item.statement_end >= period_start
+    ]
+    if not clipped:
+        return []
+    clipped.sort()
+    merged = [clipped[0]]
+    for start, end in clipped[1:]:
+        last_start, last_end = merged[-1]
+        if start <= last_end + timedelta(days=1):
+            merged[-1] = (last_start, max(last_end, end))
+        else:
+            merged.append((start, end))
+    return merged
+
+
+def _coverage_gap_days(merged_ranges: list[tuple[date, date]], *, period_start: date, period_end: date) -> int:
+    if not merged_ranges:
+        return (period_end - period_start).days + 1
+    uncovered = 0
+    cursor = period_start
+    for start, end in merged_ranges:
+        if start > cursor:
+            uncovered += (start - cursor).days
+        cursor = max(cursor, end + timedelta(days=1))
+    if cursor <= period_end:
+        uncovered += (period_end - cursor).days + 1
+    return uncovered
+
+
+def reconciliation_coverage_summary(
+    session: Session,
+    *,
+    period_start: date,
+    period_end: date,
+) -> dict[str, object]:
+    required_accounts = reconciliation_required_accounts(session, period_start=period_start, period_end=period_end)
+    account_ids = [int(row["account_id"]) for row in required_accounts]
+    sessions = list(
+        session.scalars(
+            select(ReconciliationSession)
+            .options(selectinload(ReconciliationSession.account), selectinload(ReconciliationSession.lines).selectinload(ReconciliationLine.matches))
+            .where(
+                ReconciliationSession.account_id.in_(account_ids),
+                ReconciliationSession.status == "closed",
+                ReconciliationSession.statement_start <= period_end,
+                ReconciliationSession.statement_end >= period_start,
+            )
+            .order_by(ReconciliationSession.statement_start, ReconciliationSession.statement_end, ReconciliationSession.id)
+        )
+    )
+    sessions_by_account: dict[int, list[ReconciliationSession]] = defaultdict(list)
+    for item in sessions:
+        sessions_by_account[item.account_id].append(item)
+
+    coverage_rows: list[dict[str, object]] = []
+    for account_row in required_accounts:
+        account_sessions = sessions_by_account.get(account_row["account_id"], [])
+        merged = _merged_reconciliation_ranges(account_sessions, period_start=period_start, period_end=period_end)
+        coverage_start = merged[0][0] if merged else None
+        coverage_end = merged[-1][1] if merged else None
+        gap_days = 0 if not account_row["required_for_close"] else _coverage_gap_days(merged, period_start=period_start, period_end=period_end)
+        coverage_rows.append(
+            {
+                **account_row,
+                "covered": (not account_row["required_for_close"]) or gap_days == 0,
+                "coverage_start": coverage_start,
+                "coverage_end": coverage_end,
+                "coverage_gap_days": gap_days,
+                "session_ids": [item.id for item in account_sessions],
+            }
+        )
+
+    session_rows = []
+    for item in sessions:
+        unresolved = sum(
+            1
+            for line in item.lines
+            if abs(line.amount_cents) != sum(match.applied_amount_cents for match in line.matches if match.reversed_at is None)
+        )
+        session_rows.append(
+            {
+                "session_id": item.id,
+                "account_code": item.account.code,
+                "account_name": item.account.name,
+                "statement_start": item.statement_start,
+                "statement_end": item.statement_end,
+                "statement_starting_balance_cents": item.statement_starting_balance_cents,
+                "statement_ending_balance_cents": item.statement_ending_balance_cents,
+                "status": item.status,
+                "unresolved_statement_lines": unresolved,
+            }
+        )
+    return {
+        "period_start": period_start,
+        "period_end": period_end,
+        "report_basis": "control",
+        "sessions": session_rows,
+        "coverage_rows": coverage_rows,
+    }
+
+
 def _outstanding_candidates_for_session(session: Session, recon: ReconciliationSession) -> list[dict[str, object]]:
     rows = reconciliation_candidates(session, session_id=recon.id)["rows"]
     return rows
@@ -2078,6 +2601,8 @@ def close_period(
     period_end: date,
     lock_type: str,
     reason: str | None,
+    ledger_dir: Path,
+    config: AppConfig,
     acknowledge_review_ids: list[int] | None = None,
 ) -> dict[str, object]:
     del acknowledge_review_ids
@@ -2097,37 +2622,16 @@ def close_period(
             data={"review_blocker_ids": [item.id for item in open_blockers]},
         )
 
-    active_accounts = list(
-        session.scalars(
-            select(Account)
-            .join(JournalLine, JournalLine.account_id == Account.id)
-            .join(JournalEntry, JournalLine.entry_id == JournalEntry.id)
-            .where(
-                Account.subtype.in_(FINANCIAL_SUBTYPES),
-                JournalEntry.entry_date >= period_start,
-                JournalEntry.entry_date <= period_end,
-            )
-            .distinct()
-        )
-    )
-    missing = []
-    for account in active_accounts:
-        closed_sessions = list(
-            session.scalars(
-                select(ReconciliationSession).where(
-                    ReconciliationSession.account_id == account.id,
-                    ReconciliationSession.status == "closed",
-                    ReconciliationSession.statement_start <= period_end,
-                    ReconciliationSession.statement_end >= period_start,
-                )
-            )
-        )
-        if not _reconciliation_session_coverage(closed_sessions, period_start=period_start, period_end=period_end):
-            missing.append(account.code)
+    coverage = reconciliation_coverage_summary(session, period_start=period_start, period_end=period_end)
+    missing = [
+        row["account_code"]
+        for row in coverage["coverage_rows"]
+        if row["required_for_close"] and not row["covered"]
+    ]
     if missing:
         raise ReconciliationError(
             "Cannot close period until all financial accounts are reconciled",
-            data={"account_codes": missing},
+            data={"account_codes": missing, "coverage_rows": coverage["coverage_rows"]},
         )
 
     session.add(
@@ -2141,7 +2645,23 @@ def close_period(
         )
     )
     session.flush()
-    return {"period_start": period_start, "period_end": period_end, "status": "closed"}
+    from clawbooks.integrity import persist_close_snapshot
+
+    snapshot = persist_close_snapshot(
+        session,
+        ledger_dir=ledger_dir,
+        config=config,
+        period_start=period_start,
+        period_end=period_end,
+        source="period_close",
+        reason=reason,
+    )
+    return {
+        "period_start": period_start,
+        "period_end": period_end,
+        "status": "closed",
+        "close_snapshot_id": snapshot.id,
+    }
 
 
 def reopen_period(session: Session, *, period_start: date, period_end: date, reason: str) -> dict[str, object]:

@@ -261,6 +261,7 @@ class Document(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     document_type: Mapped[str] = mapped_column(String(64), index=True)
     tax_year: Mapped[int] = mapped_column(Integer, index=True)
+    jurisdiction: Mapped[str | None] = mapped_column(String(64), index=True, default=None)
     period_start: Mapped[date | None] = mapped_column(Date, default=None)
     period_end: Mapped[date | None] = mapped_column(Date, default=None)
     scope: Mapped[str] = mapped_column(String(32), index=True, default="business")
@@ -291,3 +292,38 @@ class Setting(Base):
 
     key: Mapped[str] = mapped_column(String(128), primary_key=True)
     value_json: Mapped[str] = mapped_column(Text)
+
+
+class CloseSnapshot(Base):
+    __tablename__ = "close_snapshots"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    period_start: Mapped[date] = mapped_column(Date, index=True)
+    period_end: Mapped[date] = mapped_column(Date, index=True)
+    snapshot_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)
+    snapshot_schema_version: Mapped[int] = mapped_column(Integer, default=1)
+    report_generator_version: Mapped[str] = mapped_column(String(64))
+    report_basis_json: Mapped[str] = mapped_column(Text)
+    report_hashes_json: Mapped[str] = mapped_column(Text)
+    canonical_summaries_json: Mapped[str] = mapped_column(Text)
+    normalized_reports_json: Mapped[str] = mapped_column(Text)
+    heavy_artifact_hashes_json: Mapped[str] = mapped_column(Text)
+    heavy_artifact_summaries_json: Mapped[str] = mapped_column(Text)
+    open_review_blocker_count: Mapped[int] = mapped_column(Integer, default=0)
+    cash_basis_warnings_json: Mapped[str] = mapped_column(Text)
+    compliance_profile_json: Mapped[str] = mapped_column(Text)
+    advisory_context_json: Mapped[str | None] = mapped_column(Text, default=None)
+
+
+class AuditEvent(Base):
+    __tablename__ = "audit_events"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    entity_type: Mapped[str] = mapped_column(String(64), index=True)
+    entity_ref: Mapped[str] = mapped_column(String(255), index=True)
+    action: Mapped[str] = mapped_column(String(64), index=True)
+    before_json: Mapped[str | None] = mapped_column(Text, default=None)
+    after_json: Mapped[str | None] = mapped_column(Text, default=None)
+    source: Mapped[str] = mapped_column(String(64))
+    reason: Mapped[str | None] = mapped_column(Text, default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), index=True)

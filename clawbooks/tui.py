@@ -10,6 +10,7 @@ from textual.screen import Screen
 from textual.widgets import Button, ContentSwitcher, DataTable, DirectoryTree, Footer, Header, Input, Label, Markdown, Static, TabbedContent, TabPane
 
 from clawbooks.config import validate_ledger_dir
+from clawbooks.db import inspect_ledger_bootstrap
 from clawbooks.exceptions import ValidationError
 from clawbooks.tui_facade import REPORTS, TuiFacade
 from clawbooks.tui_models import DashboardSummary, ExportResult, HelpCommand, Metric, ReportView, StatusView, TableSection
@@ -426,6 +427,118 @@ class ExportPane(Static):
             self.app.notify(f"{result.title} created at {result.output_dir}", title="Export ready")
 
 
+class AuditPane(Static):
+    def __init__(self, facade: TuiFacade, *, id: str | None = None) -> None:
+        super().__init__(id=id)
+        self.facade = facade
+        self.summary: dict[str, object] | None = None
+        self.period_result: dict[str, object] | None = None
+        self.period_start = date.today().replace(day=1)
+        self.period_end = date.today()
+
+    def on_mount(self) -> None:
+        self.load_audit()
+
+    def load_audit(self) -> None:
+        self.summary = self.facade.audit_summary()
+        self.period_result = self.facade.audit_period(period_start=self.period_start, period_end=self.period_end)
+        self.refresh(recompose=True)
+
+    def compose(self) -> ComposeResult:
+        if not self.summary:
+            yield Static("Loading audit...", classes="empty-state")
+            return
+        summary_counts = self.summary["summary"]
+        yield Static("[bold]Audit[/bold]\nIntegrity findings, close readiness, and close-snapshot drift.", classes="view-title")
+        yield MetricStrip(
+            [
+                Metric("Critical", str(summary_counts["critical"]), tone="warning" if summary_counts["critical"] else "default"),
+                Metric("High", str(summary_counts["high"]), tone="warning" if summary_counts["high"] else "default"),
+                Metric("Medium", str(summary_counts["medium"])),
+                Metric("Low", str(summary_counts["low"])),
+            ]
+        )
+        with Horizontal(id="audit-toolbar"):
+            yield Input(value=self.period_start.isoformat(), placeholder="YYYY-MM-DD", id="audit-period-start")
+            yield Input(value=self.period_end.isoformat(), placeholder="YYYY-MM-DD", id="audit-period-end")
+            yield Button("Reload Audit", id="reload-audit")
+        with VerticalScroll(id="audit-scroll"):
+            yield SectionTableWidget(
+                TableSection(
+                    "Doctor Findings",
+                    ["severity", "category", "title"],
+                    [
+                        {
+                            "severity": finding["severity"],
+                            "category": finding["category"],
+                            "title": finding["title"],
+                        }
+                        for finding in self.summary["findings"]
+                    ],
+                    "No integrity findings.",
+                ),
+                id="audit-findings",
+            )
+            if self.period_result:
+                yield SectionTableWidget(
+                    TableSection(
+                        "Period Audit Blocking Findings",
+                        ["severity", "category", "title"],
+                        [
+                            {
+                                "severity": finding["severity"],
+                                "category": finding["category"],
+                                "title": finding["title"],
+                            }
+                            for finding in self.period_result["blocking_findings"]
+                        ],
+                        "No blocking findings for the selected period.",
+                    ),
+                    id="audit-period-blocking",
+                )
+                yield SectionTableWidget(
+                    TableSection(
+                        "Period Audit Advisory Findings",
+                        ["severity", "category", "title"],
+                        [
+                            {
+                                "severity": finding["severity"],
+                                "category": finding["category"],
+                                "title": finding["title"],
+                            }
+                            for finding in self.period_result["advisory_findings"]
+                        ],
+                        "No advisory findings for the selected period.",
+                    ),
+                    id="audit-period-advisory",
+                )
+                drift = self.period_result["snapshot_drift"]
+                yield SectionTableWidget(
+                    TableSection(
+                        "Snapshot Drift Summary",
+                        ["component", "count"],
+                        [
+                            {"component": "accounting_data_drift", "count": len(drift["accounting_data_drift"])},
+                            {"component": "admin_state_drift", "count": len(drift["admin_state_drift"])},
+                            {"component": "advisory_context_drift", "count": len(drift["advisory_context_drift"])},
+                            {"component": "report_version_drift", "count": len(drift["report_version_drift"])},
+                        ],
+                        "No snapshot drift data available.",
+                    ),
+                    id="audit-period-drift",
+                )
+
+    def on_button_pressed(self, event: Button.Pressed) -> None:
+        if event.button.id != "reload-audit":
+            return
+        try:
+            self.period_start = parse_date(self.query_one("#audit-period-start", Input).value)
+            self.period_end = parse_date(self.query_one("#audit-period-end", Input).value)
+            self.load_audit()
+        except ValidationError as exc:
+            self.app.notify(exc.message, title="Invalid audit period", severity="error")
+
+
 class HelpPane(Static):
     def __init__(self, commands: list[HelpCommand], *, id: str | None = None) -> None:
         super().__init__(id=id)
@@ -438,6 +551,30 @@ class HelpPane(Static):
             parts.append(f"{command.description}\n")
             parts.append(f"```bash\n{command.command}\n```\n")
         yield Markdown("\n".join(parts), id="help-markdown")
+
+
+class MigrationRequiredScreen(Screen[None]):
+    BINDINGS = [Binding("q", "app.quit", "Quit")]
+
+    def __init__(self, *, ledger_dir: Path, migration_state: dict[str, object]) -> None:
+        super().__init__()
+        self.ledger_dir = ledger_dir
+        self.migration_state = migration_state
+
+    def compose(self) -> ComposeResult:
+        current_revision = self.migration_state.get("current_revision") or "none"
+        expected_head = self.migration_state.get("expected_head") or "unknown"
+        yield Header(show_clock=True)
+        yield Static(
+            "[bold]Migration Required[/bold]\n"
+            f"Ledger: {self.ledger_dir}\n"
+            f"Current revision: {current_revision}\n"
+            f"Expected head: {expected_head}\n\n"
+            "Run the CLI migration command before opening this ledger in the TUI.\n\n"
+            f"uv run clawbooks --ledger '{self.ledger_dir}' migrate",
+            id="migration-required",
+        )
+        yield Footer()
 
 
 class LedgerPickerScreen(Screen[Path]):
@@ -512,6 +649,8 @@ class MainScreen(Screen[None]):
                 yield ReportPane(self.facade, id="reports-pane")
             with TabPane("Status", id="status"):
                 yield StatusPane(self.facade, id="status-pane")
+            with TabPane("Audit", id="audit"):
+                yield AuditPane(self.facade, id="audit-pane")
             with TabPane("Exports", id="exports"):
                 yield ExportPane(self.facade, id="exports-pane")
             with TabPane("Help", id="help"):
@@ -650,6 +789,7 @@ class ClawbooksTuiApp(App[None]):
         Binding("d", "show_section('dashboard')", "Dashboard"),
         Binding("r", "show_section('reports')", "Reports"),
         Binding("s", "show_section('status')", "Status"),
+        Binding("a", "show_section('audit')", "Audit"),
         Binding("e", "show_section('exports')", "Exports"),
         Binding("h", "show_section('help')", "Help"),
         Binding("q", "quit", "Quit"),
@@ -671,6 +811,10 @@ class ClawbooksTuiApp(App[None]):
             self._open_ledger(path)
 
     def _open_ledger(self, ledger_dir: Path) -> None:
+        migration_state = inspect_ledger_bootstrap(ledger_dir)
+        if not migration_state["full_open_safe"]:
+            self.push_screen(MigrationRequiredScreen(ledger_dir=ledger_dir, migration_state=migration_state))
+            return
         self.facade = TuiFacade(ledger_dir)
         self.push_screen(MainScreen(self.facade))
 

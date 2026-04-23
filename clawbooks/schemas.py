@@ -58,6 +58,22 @@ class StripeEvent(BaseModel):
     metadata: dict[str, Any] = Field(default_factory=dict)
 
 
+class StripeUnsupportedEvent(BaseModel):
+    external_id: str
+    occurred_at: datetime
+    raw_type: str
+    currency: str
+    description: str = ""
+    reason: str
+    source_id: str | None = None
+    payload: dict[str, Any] = Field(default_factory=dict)
+
+
+class StripeFetchResult(BaseModel):
+    supported_events: list[StripeEvent] = Field(default_factory=list)
+    unsupported_events: list[StripeUnsupportedEvent] = Field(default_factory=list)
+
+
 class TaxTemplate(BaseModel):
     code: str
     description: str
@@ -82,6 +98,16 @@ class SalesTaxRegistration(BaseModel):
     active: bool = True
 
 
+class SalesTaxPaymentSlot(BaseModel):
+    jurisdiction: str
+    period_start: date
+    period_end: date
+    filing_due_date: date
+    payment_expected: Literal["true", "false", "unknown"] = "unknown"
+    source: str | None = None
+    reason: str | None = None
+
+
 class PayrollProfile(BaseModel):
     confirmed: bool = False
     enabled: bool | None = None
@@ -103,6 +129,7 @@ class ComplianceProfile(BaseModel):
     entity_tax_classification: str = "single_member_llc_disregarded"
     sales_tax_profile_confirmed: bool = False
     sales_tax_registrations: list[SalesTaxRegistration] = Field(default_factory=list)
+    sales_tax_payment_slots: list[SalesTaxPaymentSlot] = Field(default_factory=list)
     payroll: PayrollProfile = Field(default_factory=PayrollProfile)
     contractor_profile: ContractorProfile = Field(default_factory=ContractorProfile)
     owner_tracking: OwnerTrackingProfile = Field(default_factory=OwnerTrackingProfile)

@@ -23,6 +23,7 @@ Do not treat `clawbooks` as:
 7. Never assume checklist `unknown` means not applicable.
 8. Never map a bank-side Stripe payout to `4000`. Stripe payouts should clear `1010`, not create revenue.
 9. Balance sheet is accrual-only. Do not describe it as cash-basis.
+10. If a ledger is not at the current schema head, stop normal commands and run `migrate` first.
 
 ## Core Commands
 
@@ -57,6 +58,18 @@ Default assumptions:
 - timezone `America/Chicago`
 - Stripe subscriptions are the only revenue stream in v1
 - checklist and tax outputs are advisory
+
+Integrity check after upgrades:
+
+```bash
+uv run clawbooks --ledger /ledger --json doctor
+```
+
+If the result says migration is required:
+
+```bash
+uv run clawbooks --ledger /ledger --json migrate
+```
 
 ## Core Accounts
 
@@ -120,6 +133,8 @@ Rules:
 - use `--receipt-path` when source evidence exists
 - use `3000` only for owner-paid, non-reimbursable expense flow
 - use `2300` only when reimbursement is expected later
+- an owner reimbursement only auto-links into cash-basis settlement when there is exactly one eligible open reimbursable source line and the reimbursement amount matches it exactly
+- otherwise reimbursement clearing stays manual and cash-basis `P&L` continues to warn until explicit settlement is added
 
 ## Stripe Import
 
@@ -145,6 +160,7 @@ Posting policy:
 - Stripe fee: debit `5000`, credit `1010`
 - payout: debit `1000`, credit `1010`
 - ambiguous refund/dispute/tax cases: do not post; create a review blocker instead
+- unsupported Stripe currencies or unsupported balance-transaction types: do not post; create a review blocker instead
 
 Blocked event workflow:
 
@@ -308,6 +324,24 @@ Rules:
 - candidate discovery may show blocked journal lines with rejection reasons; do not force those through manually
 - outstanding items carry forward through candidate discovery, not fake copied statement rows
 
+## Close Audit
+
+Audit close readiness and close-snapshot drift explicitly:
+
+```bash
+uv run clawbooks --ledger /ledger --json period audit \
+  --period-start 2026-04-01 \
+  --period-end 2026-04-30
+```
+
+Interpretation:
+- `closable_now` reflects enforced close prerequisites
+- `blocking_findings` explain what currently blocks close
+- `snapshot_drift.accounting_data_drift` means closed-period books changed
+- `snapshot_drift.admin_state_drift` means compliance profile or document metadata changed
+- `snapshot_drift.advisory_context_drift` only applies to full calendar-year closes
+- if a period was reopened after close, snapshot drift is historical context and `historical_only` will be true
+
 ## Reporting
 
 Cash-basis `P&L`:
@@ -410,6 +444,17 @@ Example profile:
   "sales_tax_registrations": [
     {"jurisdiction": "illinois", "filing_cadence": "monthly", "active": true}
   ],
+  "sales_tax_payment_slots": [
+    {
+      "jurisdiction": "illinois",
+      "period_start": "2026-01-01",
+      "period_end": "2026-01-31",
+      "filing_due_date": "2026-02-20",
+      "payment_expected": "true",
+      "source": "idor_notice",
+      "reason": "January filing requires remittance"
+    }
+  ],
   "payroll": {"confirmed": true, "enabled": false, "provider": null, "states": []},
   "contractor_profile": {"confirmed": false, "requires_1099_nec_documents": null, "handled_by": null},
   "owner_tracking": {"estimated_tax_confirmations": true}
@@ -419,6 +464,7 @@ Example profile:
 Rules:
 - if facts are not explicit, checklist items should remain `unknown`
 - do not infer contractor or sales-tax filing duties from raw ledger activity alone
+- do not infer sales-tax payment completeness from cadence or `2100`; use explicit filing-slot payment expectations
 
 ## Accountant Packet
 
@@ -428,7 +474,8 @@ Add support docs:
 uv run clawbooks --ledger /ledger --json document add \
   --source-path /path/to/stripe-1099-k.pdf \
   --type stripe_1099_k \
-  --year 2026
+  --year 2026 \
+  --jurisdiction illinois
 ```
 
 Inspect checklist:
@@ -448,6 +495,7 @@ Packet rules:
 - it includes compliance-profile snapshot and unsupported cash-basis warnings
 - `year_end_books_package` is only `present` after the year-end export exists
 - legacy attachments not registered as documents are not included automatically
+- cadence-sensitive checklist items require exact period metadata and, for sales-tax items, matching jurisdiction metadata
 
 ## Escalate to a Human or CPA
 

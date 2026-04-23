@@ -32,3 +32,8 @@ class ImportConflictError(AppError):
 class ComplianceError(AppError):
     def __init__(self, message: str, *, data: dict | None = None) -> None:
         super().__init__(message, exit_code=6, data=data)
+
+
+class MigrationRequiredError(AppError):
+    def __init__(self, message: str, *, data: dict | None = None) -> None:
+        super().__init__(message, exit_code=2, data=data)
