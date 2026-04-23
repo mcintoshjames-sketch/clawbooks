@@ -703,6 +703,10 @@ def post_journal_entry(
         created_at=utcnow(),
         reversal_of_entry_id=reversal_of_entry_id,
         import_run_id=import_run_id,
+        # Persist explicit values for non-null bookkeeping flags instead of
+        # relying on ORM-side defaults during insert construction.
+        review_required=False,
+        cash_basis_included=False,
     )
     session.add(entry)
     session.flush()

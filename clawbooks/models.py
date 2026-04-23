@@ -52,6 +52,10 @@ class JournalEntry(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
     reversal_of_entry_id: Mapped[int | None] = mapped_column(ForeignKey("journal_entries.id"), default=None)
     import_run_id: Mapped[int | None] = mapped_column(ForeignKey("imports.id"), default=None)
+    review_required: Mapped[bool] = mapped_column(Boolean, default=False)
+    review_message: Mapped[str | None] = mapped_column(Text, default=None)
+    review_acknowledged_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), default=None)
+    cash_basis_included: Mapped[bool] = mapped_column(Boolean, default=False)
 
     lines: Mapped[list["JournalLine"]] = relationship(back_populates="entry", cascade="all, delete-orphan")
 
