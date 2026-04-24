@@ -10,7 +10,7 @@ from clawbooks.cli import app as cli_app
 from clawbooks.db import session_scope
 from clawbooks.models import JournalEntry
 from clawbooks.tui import ClawbooksTuiApp, ExportPane, HelpPane, MainScreen, ReportPane, StatusPane
-from tests.helpers import init_ledger, record_expense, runner
+from tests.helpers import init_ledger, invoke_cli, record_expense, runner
 
 
 def patch_home(monkeypatch, home: Path) -> None:
@@ -101,6 +101,48 @@ async def test_tui_report_presets_refresh_report_state(tmp_path) -> None:
         ytd_net_income = next(metric.value for metric in reports.current_view.metrics if metric.label == "Net Income")
         assert default_net_income != ytd_net_income
         assert reports.current_view.start == date(today.year, 1, 1)
+
+
+@pytest.mark.asyncio
+async def test_tui_pnl_basis_toggle_switches_between_cash_and_accrual(tmp_path) -> None:
+    ledger = init_ledger(tmp_path)
+    today = date.today()
+    accrued = invoke_cli(
+        ledger,
+        "journal",
+        "add",
+        "--date",
+        today.isoformat(),
+        "--description",
+        "Accrued software",
+        "--line",
+        "5110:100.00",
+        "--line",
+        "2300:-100.00",
+    )
+    assert accrued.exit_code == 0, accrued.stdout
+
+    app = ClawbooksTuiApp(ledger_dir=ledger)
+    async with app.run_test(size=(120, 40)) as pilot:
+        await pilot.press("r")
+        reports = app.screen.query_one("#reports-pane", ReportPane)
+        await pilot.pause()
+
+        assert reports.current_basis == "cash"
+        assert reports.current_view is not None
+        assert reports.current_view.basis == "cash"
+        cash_expenses = next(metric.value for metric in reports.current_view.metrics if metric.label == "Expenses")
+
+        await pilot.click("#report-basis-accrual")
+        await pilot.pause()
+
+        assert reports.current_basis == "accrual"
+        assert reports.current_view is not None
+        assert reports.current_view.basis == "accrual"
+        accrual_expenses = next(metric.value for metric in reports.current_view.metrics if metric.label == "Expenses")
+        assert cash_expenses != accrual_expenses
+        assert accrual_expenses == "$100.00"
+        assert "Accrual Basis" in reports.current_view.title
 
 
 @pytest.mark.asyncio

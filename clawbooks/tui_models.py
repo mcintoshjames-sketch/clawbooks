@@ -39,6 +39,7 @@ class ReportView:
     key: str
     title: str
     mode: ReportMode
+    basis: Literal["cash", "accrual"] | None = None
     start: date | None = None
     end: date | None = None
     as_of: date | None = None

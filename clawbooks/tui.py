@@ -135,6 +135,7 @@ class ReportPane(Static):
         super().__init__(id=id)
         self.facade = facade
         self.current_report_key = "pnl"
+        self.current_basis = facade.config.default_report_basis
         self.current_view: ReportView | None = None
 
     def on_mount(self) -> None:
@@ -162,6 +163,19 @@ class ReportPane(Static):
                         yield Button("MTD", id="report-preset-mtd")
                         yield Button("QTD", id="report-preset-qtd")
                         yield Button("YTD", id="report-preset-ytd")
+                        if self.current_report_key == "pnl":
+                            yield Button(
+                                "Cash",
+                                id="report-basis-cash",
+                                classes=f"basis-toggle {'active' if self.current_basis == 'cash' else ''}",
+                                variant="primary" if self.current_basis == "cash" else "default",
+                            )
+                            yield Button(
+                                "Accrual",
+                                id="report-basis-accrual",
+                                classes=f"basis-toggle {'active' if self.current_basis == 'accrual' else ''}",
+                                variant="primary" if self.current_basis == "accrual" else "default",
+                            )
                         yield Input(value=range_start, placeholder="YYYY-MM-DD", id="report-start")
                         yield Input(value=range_end, placeholder="YYYY-MM-DD", id="report-end")
                         yield Button("Apply", id="report-apply-range")
@@ -183,6 +197,7 @@ class ReportPane(Static):
                 preset=defaults["preset"],
                 start=defaults["start"],
                 end=defaults["end"],
+                basis=self.current_basis if self.current_report_key == "pnl" else None,
             )
         else:
             self.current_view = self.facade.report(self.current_report_key, as_of=defaults["as_of"])
@@ -190,13 +205,18 @@ class ReportPane(Static):
 
     def load_range_report(self, *, preset: str | None = None, start: str | None = None, end: str | None = None) -> None:
         if preset:
-            self.current_view = self.facade.report(self.current_report_key, preset=preset)
+            self.current_view = self.facade.report(
+                self.current_report_key,
+                preset=preset,
+                basis=self.current_basis if self.current_report_key == "pnl" else None,
+            )
         else:
             self.current_view = self.facade.report(
                 self.current_report_key,
                 preset="CUSTOM",
                 start=parse_date(start),
                 end=parse_date(end),
+                basis=self.current_basis if self.current_report_key == "pnl" else None,
             )
         self.refresh(recompose=True)
 
@@ -209,6 +229,10 @@ class ReportPane(Static):
         if button_id.startswith("report-nav-"):
             self.current_report_key = button_id.removeprefix("report-nav-")
             self.load_default_report()
+            return
+        if button_id in {"report-basis-cash", "report-basis-accrual"}:
+            self.current_basis = button_id.removeprefix("report-basis-")
+            self.load_range_report(start=self.query_one("#report-start", Input).value, end=self.query_one("#report-end", Input).value)
             return
         if button_id == "report-preset-mtd":
             self.load_range_report(preset="MTD")
@@ -738,6 +762,10 @@ class ClawbooksTuiApp(App[None]):
     }
 
     .report-nav-button.active {
+        text-style: bold;
+    }
+
+    .basis-toggle.active {
         text-style: bold;
     }
 

@@ -16,13 +16,15 @@ def test_tui_facade_normalizes_dashboard_and_reports(tmp_path) -> None:
 
     dashboard = facade.dashboard(as_of=today)
     assert dashboard.business_name == "Example LLC"
-    assert any(metric.label == "YTD Net Income" for metric in dashboard.metrics)
+    assert any(metric.label == "YTD Net Income (Cash)" for metric in dashboard.metrics)
     assert dashboard.sections[0].title == "Key Balances"
 
     pnl_view = facade.report("pnl", preset="YTD")
-    assert pnl_view.title == "Profit & Loss"
+    assert pnl_view.title == "Profit & Loss (Cash Basis)"
+    assert pnl_view.basis == "cash"
     assert pnl_view.mode == "range"
     assert pnl_view.sections[0].title == "Accounts"
+    assert any(metric.label == "Basis" and metric.value == "Cash" for metric in pnl_view.metrics)
     assert any(metric.label == "Net Income" for metric in pnl_view.metrics)
 
     balance_sheet_view = facade.report("balance_sheet", as_of=today)

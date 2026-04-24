@@ -39,6 +39,7 @@ from clawbooks.tui_models import DashboardSummary, ExportResult, HelpCommand, Me
 from clawbooks.utils import format_money
 
 Preset = Literal["MTD", "QTD", "YTD", "CUSTOM"]
+ReportBasis = Literal["cash", "accrual"]
 
 
 @dataclass(slots=True, frozen=True)
@@ -143,7 +144,7 @@ class TuiFacade:
             ledger_dir=self.ledger_dir,
             as_of=as_of,
             metrics=[
-                Metric("YTD Net Income", format_money(ytd["totals"]["net_income_cents"])),
+                Metric(f"YTD Net Income ({str(ytd.get('report_basis', self.config.default_report_basis)).title()})", format_money(ytd["totals"]["net_income_cents"])),
                 Metric("Pending Tax Obligations", str(int(pending_obligations))),
                 Metric("Open Reconciliations", str(int(open_reconciliations))),
                 Metric("Open Review Blockers", str(int(open_blockers)), tone="warning" if open_blockers else "default"),
@@ -168,6 +169,7 @@ class TuiFacade:
         start: date | None = None,
         end: date | None = None,
         as_of: date | None = None,
+        basis: ReportBasis | None = None,
     ) -> ReportView:
         descriptor = REPORTS[report_key]
         today = date.today()
@@ -183,7 +185,7 @@ class TuiFacade:
 
         with session_scope(self.ledger_dir) as session:
             if report_key == "pnl":
-                payload = pnl(session, period_start=start, period_end=end, basis=self.config.default_report_basis)
+                payload = pnl(session, period_start=start, period_end=end, basis=basis or self.config.default_report_basis)
             elif report_key == "balance_sheet":
                 payload = balance_sheet(session, as_of=as_of)
             elif report_key == "cash_flow":
@@ -427,7 +429,9 @@ class TuiFacade:
         as_of: date | None,
     ) -> ReportView:
         if descriptor.key == "pnl":
+            report_basis = str(payload.get("report_basis", "cash"))
             metrics = [
+                Metric("Basis", report_basis.title()),
                 Metric("Revenue", format_money(payload["totals"]["revenue_cents"])),
                 Metric("Expenses", format_money(payload["totals"]["expense_cents"])),
                 Metric("Net Income", format_money(payload["totals"]["net_income_cents"])),
@@ -530,8 +534,9 @@ class TuiFacade:
 
         return ReportView(
             key=descriptor.key,
-            title=descriptor.title,
+            title=f"{descriptor.title} ({report_basis.title()} Basis)" if descriptor.key == "pnl" else descriptor.title,
             mode=descriptor.mode,
+            basis=report_basis if descriptor.key == "pnl" and report_basis in {"cash", "accrual"} else None,
             start=start,
             end=end,
             as_of=as_of,

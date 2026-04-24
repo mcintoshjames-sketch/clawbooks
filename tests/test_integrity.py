@@ -33,6 +33,11 @@ def legacyize_ledger(ledger: Path) -> None:
         connection.execute("DROP TABLE alembic_version")
         connection.execute("DROP TABLE close_snapshots")
         connection.execute("DROP TABLE audit_events")
+        for column in ("review_required", "review_message", "review_acknowledged_at", "cash_basis_included"):
+            try:
+                connection.execute(f"ALTER TABLE journal_entries DROP COLUMN {column}")
+            except sqlite3.OperationalError:
+                pass
         connection.execute(
             """
             CREATE TABLE IF NOT EXISTS attachments (
