@@ -542,12 +542,12 @@ class TuiFacade:
             metrics = [
                 Metric("Assets", str(len(payload["rows"]))),
                 Metric("Cost", format_money(int(payload["totals"]["cost_cents"]))),
-                Metric("Book Basis", format_money(int(payload["totals"]["book_basis_cents"]))),
+                Metric("Net Book Value", format_money(int(payload["totals"]["book_basis_cents"]))),
             ]
             sections = [
                 TableSection(
                     "Fixed Assets",
-                    ["asset_id", "description", "purchase_date", "cost_cents", "posted_book_depreciation_cents", "book_basis_cents", "tax_basis_cents"],
+                    ["asset_id", "description", "purchase_date", "cost_cents", "posted_book_depreciation_cents", "net_book_value_cents", "tax_basis_cents"],
                     payload["rows"],
                     "No fixed assets.",
                 )
