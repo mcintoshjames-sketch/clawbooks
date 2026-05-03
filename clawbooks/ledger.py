@@ -76,6 +76,7 @@ DOCUMENT_TYPES = {
     "stripe_1099_k",
     "stripe_statement",
     "stripe_tax_summary",
+    "tax_depreciation_support",
     "tax_notice",
 }
 REVIEW_RESOLUTION_TYPES = {"skip", "post_with_override", "superseded_by_manual_entry"}
@@ -988,7 +989,7 @@ def _asset_business_basis(cost_cents: int, business_use_percent: int) -> int:
 
 def asset_depreciable_basis(asset: FixedAsset) -> int:
     base = max(asset.cost_cents - asset.salvage_value_cents, 0)
-    return _asset_business_basis(base, asset.business_use_percent)
+    return base
 
 
 def asset_tax_basis(asset: FixedAsset) -> int:
@@ -1129,7 +1130,12 @@ def add_fixed_asset(
         offset_code = "2300" if reimbursement else "3000"
     if not offset_code:
         raise ValidationError("Payment account is required unless --paid-personally is set")
-    get_account(session, offset_code)
+    offset_account = get_account(session, offset_code)
+    if not paid_personally and offset_account.subtype not in FINANCIAL_SUBTYPES:
+        raise ValidationError(
+            "Fixed asset payment account must be a supported financial account; use --paid-personally for owner contribution or reimbursement payable funding",
+            data={"account_code": offset_account.code, "subtype": offset_account.subtype},
+        )
 
     entry = post_journal_entry(
         session,
@@ -1266,6 +1272,11 @@ def set_asset_tax_depreciation(
             data={"period_start": tax_year_start, "period_end": tax_year_end},
         )
     asset = get_fixed_asset(session, asset_id)
+    if tax_year < asset.placed_in_service_date.year:
+        raise ValidationError(
+            "Tax depreciation cannot be recorded before the asset is placed in service",
+            data={"asset_id": asset.id, "placed_in_service_date": asset.placed_in_service_date, "tax_year": tax_year},
+        )
     amount_cents = parse_money(amount)
     if amount_cents < 0:
         raise ValidationError("Tax depreciation amount cannot be negative")
@@ -1283,6 +1294,7 @@ def set_asset_tax_depreciation(
             select(func.coalesce(func.sum(AssetTaxDepreciation.amount_cents), 0)).where(
                 AssetTaxDepreciation.asset_id == asset_id,
                 AssetTaxDepreciation.id != (existing.id if existing else -1),
+                AssetTaxDepreciation.tax_year <= tax_year,
             )
         )
         or 0
@@ -1320,7 +1332,7 @@ def set_asset_tax_depreciation(
 def auto_post_book_depreciation(session: Session, *, period_start: date, period_end: date) -> list[dict[str, object]]:
     ensure_interval_unlocked(session, period_start, period_end)
     results: list[dict[str, object]] = []
-    assets = list_fixed_assets(session, include_inactive=False)
+    assets = list_fixed_assets(session, include_inactive=True)
     for asset in assets:
         if asset.placed_in_service_date > period_end:
             continue

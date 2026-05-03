@@ -280,6 +280,382 @@ def test_monthly_close_does_not_block_advisory_tax_depreciation_entry(tmp_path: 
     assert tax_result.exit_code == 0, tax_result.stdout
 
 
+def test_fixed_asset_payment_account_must_be_financial(tmp_path: Path) -> None:
+    ledger = init_ledger(tmp_path)
+    result = invoke(
+        ledger,
+        "asset",
+        "add",
+        "--description",
+        "Computer",
+        "--purchase-date",
+        "2026-01-15",
+        "--cost",
+        "1200.00",
+        "--payment-account",
+        "4000",
+    )
+    body = payload(result)
+    assert result.exit_code == 2
+    assert "payment account must be a supported financial account" in body["errors"][0]
+
+
+def test_tax_depreciation_cannot_predate_placed_in_service_year(tmp_path: Path) -> None:
+    ledger = init_ledger(tmp_path)
+    assert invoke(
+        ledger,
+        "asset",
+        "add",
+        "--description",
+        "Computer",
+        "--purchase-date",
+        "2026-01-15",
+        "--placed-in-service-date",
+        "2026-01-15",
+        "--cost",
+        "1200.00",
+        "--paid-personally",
+    ).exit_code == 0
+
+    result = invoke(
+        ledger,
+        "asset",
+        "tax",
+        "set",
+        "--asset-id",
+        "1",
+        "--year",
+        "2025",
+        "--deduction-type",
+        "section_179",
+        "--amount",
+        "1200.00",
+    )
+    body = payload(result)
+    assert result.exit_code == 2
+    assert "before the asset is placed in service" in body["errors"][0]
+
+
+def test_book_basis_ignores_business_use_percent_and_ties_to_balance_sheet(tmp_path: Path) -> None:
+    ledger = init_ledger(tmp_path)
+    assert invoke(
+        ledger,
+        "asset",
+        "add",
+        "--description",
+        "Computer",
+        "--purchase-date",
+        "2026-01-15",
+        "--placed-in-service-date",
+        "2026-01-15",
+        "--cost",
+        "1200.00",
+        "--useful-life-months",
+        "12",
+        "--business-use-percent",
+        "50",
+        "--paid-personally",
+    ).exit_code == 0
+    assert invoke(
+        ledger,
+        "period",
+        "close",
+        "--period-start",
+        "2026-01-01",
+        "--period-end",
+        "2026-01-31",
+        "--reason",
+        "month close",
+    ).exit_code == 0
+
+    fixed_assets = payload(invoke(ledger, "report", "fixed-assets", "--as-of", "2026-01-31"))
+    assert fixed_assets["data"]["totals"]["book_basis_cents"] == 110000
+    assert fixed_assets["data"]["rows"][0]["book_depreciable_basis_cents"] == 120000
+    balance = payload(invoke(ledger, "report", "balance-sheet", "--as-of", "2026-01-31"))
+    assert balance["data"]["totals"]["assets_cents"] == 110000
+
+
+def test_fixed_asset_book_basis_ties_to_balance_sheet_when_salvage_exists(tmp_path: Path) -> None:
+    ledger = init_ledger(tmp_path)
+    assert invoke(
+        ledger,
+        "asset",
+        "add",
+        "--description",
+        "Computer",
+        "--purchase-date",
+        "2026-01-15",
+        "--placed-in-service-date",
+        "2026-01-15",
+        "--cost",
+        "1200.00",
+        "--salvage-value",
+        "200.00",
+        "--useful-life-months",
+        "12",
+        "--paid-personally",
+    ).exit_code == 0
+
+    before_depreciation = payload(invoke(ledger, "report", "fixed-assets", "--as-of", "2026-01-31"))
+    assert before_depreciation["data"]["rows"][0]["book_depreciable_basis_cents"] == 100000
+    assert before_depreciation["data"]["rows"][0]["book_basis_cents"] == 120000
+    balance = payload(invoke(ledger, "report", "balance-sheet", "--as-of", "2026-01-31"))
+    assert balance["data"]["totals"]["assets_cents"] == 120000
+
+    assert invoke(
+        ledger,
+        "period",
+        "close",
+        "--period-start",
+        "2026-01-01",
+        "--period-end",
+        "2026-01-31",
+        "--reason",
+        "month close",
+    ).exit_code == 0
+    fixed_assets = payload(invoke(ledger, "report", "fixed-assets", "--as-of", "2026-01-31"))
+    balance = payload(invoke(ledger, "report", "balance-sheet", "--as-of", "2026-01-31"))
+    assert fixed_assets["data"]["rows"][0]["posted_book_depreciation_cents"] == 8333
+    assert fixed_assets["data"]["rows"][0]["book_basis_cents"] == 111667
+    assert balance["data"]["totals"]["assets_cents"] == 111667
+
+
+def test_inactive_asset_status_does_not_suppress_depreciation_without_disposal_model(tmp_path: Path) -> None:
+    ledger = init_ledger(tmp_path)
+    assert invoke(
+        ledger,
+        "asset",
+        "add",
+        "--description",
+        "Computer",
+        "--purchase-date",
+        "2026-01-15",
+        "--cost",
+        "1200.00",
+        "--useful-life-months",
+        "12",
+        "--paid-personally",
+    ).exit_code == 0
+    assert invoke(ledger, "asset", "update", "--asset-id", "1", "--status", "inactive").exit_code == 0
+    close = payload(
+        invoke(
+            ledger,
+            "period",
+            "close",
+            "--period-start",
+            "2026-01-01",
+            "--period-end",
+            "2026-01-31",
+            "--reason",
+            "month close",
+        )
+    )
+    assert close["data"]["book_depreciation_postings"][0]["amount_cents"] == 10000
+    book = payload(invoke(ledger, "report", "book-depreciation", "--period-start", "2026-01-01", "--period-end", "2026-01-31"))
+    assert book["data"]["totals"]["missing_book_depreciation_cents"] == 0
+
+
+def test_cash_basis_depreciation_exclusion_is_noncash_not_settlement_prompt(tmp_path: Path) -> None:
+    ledger = init_ledger(tmp_path)
+    assert invoke(
+        ledger,
+        "asset",
+        "add",
+        "--description",
+        "Computer",
+        "--purchase-date",
+        "2026-01-15",
+        "--cost",
+        "1200.00",
+        "--useful-life-months",
+        "12",
+        "--paid-personally",
+    ).exit_code == 0
+    assert invoke(
+        ledger,
+        "period",
+        "close",
+        "--period-start",
+        "2026-01-01",
+        "--period-end",
+        "2026-01-31",
+        "--reason",
+        "month close",
+    ).exit_code == 0
+
+    cash = payload(
+        invoke(
+            ledger,
+            "report",
+            "pnl",
+            "--period-start",
+            "2026-01-01",
+            "--period-end",
+            "2026-01-31",
+            "--basis",
+            "cash",
+        )
+    )
+    assert cash["data"]["excluded_lines"][0]["reason"] == "Book depreciation is noncash and excluded from cash-basis P&L."
+    assert "until explicitly settled" not in " ".join(cash["warnings"])
+
+
+def test_asset_checklist_requires_linked_purchase_and_tax_support_documents(tmp_path: Path) -> None:
+    ledger = init_ledger(tmp_path)
+    source = write_text(tmp_path / "support.txt", "support")
+    assert invoke(
+        ledger,
+        "asset",
+        "add",
+        "--description",
+        "Computer 1",
+        "--purchase-date",
+        "2026-01-15",
+        "--cost",
+        "1200.00",
+        "--paid-personally",
+    ).exit_code == 0
+    assert invoke(
+        ledger,
+        "asset",
+        "add",
+        "--description",
+        "Computer 2",
+        "--purchase-date",
+        "2026-01-15",
+        "--cost",
+        "800.00",
+        "--paid-personally",
+    ).exit_code == 0
+    assert invoke(
+        ledger,
+        "document",
+        "add",
+        "--source-path",
+        str(source),
+        "--type",
+        "fixed_asset_purchase",
+        "--year",
+        "2026",
+        "--period-start",
+        "2026-01-15",
+        "--period-end",
+        "2026-01-15",
+    ).exit_code == 0
+    checklist = payload(invoke(ledger, "document", "checklist", "--year", "2026"))["data"]["rows"]
+    purchase_row = next(row for row in checklist if row["item_key"] == "fixed_asset_purchase_documents")
+    assert purchase_row["status"] == "missing"
+    assert purchase_row["document_count"] == 0
+
+    linked_purchase = write_text(tmp_path / "linked-purchase.txt", "linked")
+    assert invoke(
+        ledger,
+        "document",
+        "add",
+        "--source-path",
+        str(linked_purchase),
+        "--type",
+        "fixed_asset_purchase",
+        "--year",
+        "2026",
+        "--fixed-asset-id",
+        "1",
+    ).exit_code == 0
+    checklist = payload(invoke(ledger, "document", "checklist", "--year", "2026"))["data"]["rows"]
+    purchase_row = next(row for row in checklist if row["item_key"] == "fixed_asset_purchase_documents")
+    assert purchase_row["status"] == "missing"
+    assert purchase_row["document_count"] == 1
+
+    assert invoke(
+        ledger,
+        "asset",
+        "tax",
+        "set",
+        "--asset-id",
+        "1",
+        "--year",
+        "2026",
+        "--deduction-type",
+        "section_179",
+        "--amount",
+        "1200.00",
+    ).exit_code == 0
+    checklist = payload(invoke(ledger, "document", "checklist", "--year", "2026"))["data"]["rows"]
+    tax_row = next(row for row in checklist if row["item_key"] == "tax_depreciation_support")
+    assert tax_row["status"] == "missing"
+    assert tax_row["document_count"] == 0
+
+    tax_support = write_text(tmp_path / "tax-support.txt", "tax support")
+    assert invoke(
+        ledger,
+        "document",
+        "add",
+        "--source-path",
+        str(tax_support),
+        "--type",
+        "tax_depreciation_support",
+        "--year",
+        "2026",
+        "--fixed-asset-id",
+        "1",
+    ).exit_code == 0
+    checklist = payload(invoke(ledger, "document", "checklist", "--year", "2026"))["data"]["rows"]
+    tax_row = next(row for row in checklist if row["item_key"] == "tax_depreciation_support")
+    assert tax_row["status"] == "present"
+    assert tax_row["document_count"] == 1
+
+
+def test_tax_depreciation_basis_ignores_future_year_records(tmp_path: Path) -> None:
+    ledger = init_ledger(tmp_path)
+    assert invoke(
+        ledger,
+        "asset",
+        "add",
+        "--description",
+        "Computer",
+        "--purchase-date",
+        "2026-01-15",
+        "--placed-in-service-date",
+        "2026-01-15",
+        "--cost",
+        "1200.00",
+        "--paid-personally",
+    ).exit_code == 0
+    assert invoke(
+        ledger,
+        "asset",
+        "tax",
+        "set",
+        "--asset-id",
+        "1",
+        "--year",
+        "2027",
+        "--deduction-type",
+        "macrs",
+        "--amount",
+        "100.00",
+    ).exit_code == 0
+
+    section_179 = payload(
+        invoke(
+            ledger,
+            "asset",
+            "tax",
+            "set",
+            "--asset-id",
+            "1",
+            "--year",
+            "2026",
+            "--deduction-type",
+            "section_179",
+            "--amount",
+            "1200.00",
+        )
+    )
+    assert section_179["data"]["tax_depreciation"]["tax_basis_before_cents"] == 120000
+    assert section_179["data"]["tax_depreciation"]["tax_basis_after_cents"] == 0
+
+
 def test_unbalanced_journal_returns_validation_error(tmp_path: Path) -> None:
     ledger = init_ledger(tmp_path)
     result = invoke(

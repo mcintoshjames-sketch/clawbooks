@@ -107,6 +107,13 @@ uv run clawbooks --ledger ./demo asset tax set \
 
 Book depreciation is straight-line by month and is posted automatically on `period close` as `Dr 5170 Depreciation Expense`, `Cr 1590 Accumulated Depreciation - Computer Equipment`. Tax depreciation is not posted to the ledger; it appears in advisory reports and accountant packets for preparer review.
 
+Controls:
+- `--payment-account` must be a financial account such as bank, Stripe clearing, or card; use `--paid-personally` for owner contribution or reimbursement payable funding.
+- Book depreciation uses the capitalized book cost less salvage; `business-use-percent` is retained for advisory tax-basis reporting, not for reducing GAAP/book fixed-asset basis.
+- Tax depreciation cannot be recorded for a year before the asset is placed in service.
+- Asset status is not a disposal or retirement workflow; depreciation continues until a real disposal model exists.
+- Fixed-asset purchase support and tax-depreciation support must be registered as documents and linked to the fixed asset.
+
 Useful reports:
 
 ```bash

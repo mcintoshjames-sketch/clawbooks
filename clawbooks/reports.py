@@ -225,6 +225,23 @@ def cash_basis_snapshot(session: Session, *, period_start: date, period_end: dat
             bucket["amount_cents"] += source_line.amount_cents
             continue
 
+        if source_line.entry.source_type == "book_depreciation":
+            excluded_lines.append(
+                {
+                    "line_id": source_line.id,
+                    "entry_id": source_line.entry_id,
+                    "entry_date": source_line.entry.entry_date,
+                    "account_code": source_line.account.code,
+                    "account_name": source_line.account.name,
+                    "excluded_amount_cents": abs(source_line.amount_cents),
+                    "reason": "Book depreciation is noncash and excluded from cash-basis P&L.",
+                }
+            )
+            warnings.append(
+                f"Excluded noncash book depreciation on line {source_line.id} ({source_line.account.code}) from cash-basis P&L."
+            )
+            continue
+
         settled_in_period = session.scalar(
             select(func.coalesce(func.sum(SettlementApplication.applied_amount_cents), 0)).where(
                 SettlementApplication.source_line_id == source_line.id,
@@ -523,7 +540,7 @@ def fixed_assets_report(session: Session, *, as_of: date) -> dict[str, object]:
     )
     for asset in assets:
         book_accumulated = book_depreciation_posted_through(session, asset.id, as_of=as_of)
-        book_basis = max(asset_depreciable_basis(asset) - book_accumulated, 0)
+        net_book_value = max(asset.cost_cents - book_accumulated, 0)
         tax_depreciation = int(
             session.scalar(
                 select(func.coalesce(func.sum(AssetTaxDepreciation.amount_cents), 0)).where(
@@ -536,7 +553,7 @@ def fixed_assets_report(session: Session, *, as_of: date) -> dict[str, object]:
         tax_basis = max(asset_tax_basis(asset) - tax_depreciation, 0)
         total_cost += asset.cost_cents
         total_book_accumulated += book_accumulated
-        total_book_basis += book_basis
+        total_book_basis += net_book_value
         total_tax_basis += tax_basis
         rows.append(
             {
@@ -555,7 +572,8 @@ def fixed_assets_report(session: Session, *, as_of: date) -> dict[str, object]:
                 "useful_life_months": asset.useful_life_months,
                 "book_depreciable_basis_cents": asset_depreciable_basis(asset),
                 "posted_book_depreciation_cents": book_accumulated,
-                "book_basis_cents": book_basis,
+                "book_basis_cents": net_book_value,
+                "net_book_value_cents": net_book_value,
                 "tax_depreciation_cents": tax_depreciation,
                 "tax_basis_cents": tax_basis,
                 "source_journal_entry_id": asset.source_journal_entry_id,
@@ -652,7 +670,7 @@ def depreciation_difference_report(session: Session, *, year: int) -> dict[str, 
             )
             or 0
         )
-        book_basis = max(asset_depreciable_basis(asset) - book_depreciation_posted_through(session, asset.id, as_of=period_end), 0)
+        book_basis = max(asset.cost_cents - book_depreciation_posted_through(session, asset.id, as_of=period_end), 0)
         tax_basis = max(
             asset_tax_basis(asset)
             - int(
@@ -1332,10 +1350,6 @@ def document_checklist(session: Session, *, ledger_dir: Path, year: int) -> dict
             document
             for document in by_type["fixed_asset_purchase"]
             if any(link.get("target_type") == "fixed_asset" and int(link.get("target_id")) == asset.id for link in document.get("links", []))
-            or (
-                document.get("period_start") == asset.purchase_date
-                and document.get("period_end") == asset.purchase_date
-            )
         ]
         fixed_asset_doc_ids.update(int(document["document_id"]) for document in matching_documents)
         fixed_asset_slot_details.append(
@@ -1355,7 +1369,7 @@ def document_checklist(session: Session, *, ledger_dir: Path, year: int) -> dict
             document_count=len(fixed_asset_doc_ids),
             required_count=len(year_assets),
             document_types="fixed_asset_purchase",
-            notes="Fixed-asset purchase documents should be linked to each fixed asset or carry matching purchase-date period metadata.",
+            notes="Fixed-asset purchase documents must be linked to the fixed asset. Same-date document metadata alone does not prove asset-level support.",
             slot_details=fixed_asset_slot_details or None,
         )
     )
@@ -1363,26 +1377,34 @@ def document_checklist(session: Session, *, ledger_dir: Path, year: int) -> dict
     tax_depreciation_records = list(
         session.scalars(select(AssetTaxDepreciation).where(AssetTaxDepreciation.tax_year == year).order_by(AssetTaxDepreciation.asset_id))
     )
+    tax_depreciation_asset_ids = {record.asset_id for record in tax_depreciation_records}
+    tax_support_doc_ids: set[int] = set()
+    tax_support_details: list[dict[str, object]] = []
+    for asset_id in sorted(tax_depreciation_asset_ids):
+        matching_documents = [
+            document
+            for document in by_type["tax_depreciation_support"]
+            if any(link.get("target_type") == "fixed_asset" and int(link.get("target_id")) == asset_id for link in document.get("links", []))
+        ]
+        tax_support_doc_ids.update(int(document["document_id"]) for document in matching_documents)
+        tax_support_details.append(
+            {
+                "asset_id": asset_id,
+                "tax_year": year,
+                "status": "present" if matching_documents else "missing",
+                "document_ids": [int(document["document_id"]) for document in matching_documents],
+            }
+        )
     rows.append(
         _checklist_row(
             item_key="tax_depreciation_support",
             title="Tax Depreciation Support",
-            status="present" if tax_depreciation_records else "not_applicable",
-            document_count=len(tax_depreciation_records),
-            required_count=len(tax_depreciation_records),
-            document_types="tax_depreciation_report",
-            notes="Tax depreciation is operator-entered advisory support only. Eligibility for Section 179, bonus depreciation, or MACRS remains CPA judgment.",
-            slot_details=[
-                {
-                    "asset_id": record.asset_id,
-                    "tax_year": record.tax_year,
-                    "deduction_type": record.deduction_type,
-                    "amount_cents": record.amount_cents,
-                    "status": "present",
-                }
-                for record in tax_depreciation_records
-            ]
-            or None,
+            status="not_applicable" if not tax_depreciation_records else ("present" if all(item["status"] == "present" for item in tax_support_details) else "missing"),
+            document_count=len(tax_support_doc_ids),
+            required_count=len(tax_depreciation_asset_ids),
+            document_types="tax_depreciation_support",
+            notes="Operator-entered tax depreciation records are not support documents. Add and link CPA memos, Form 4562 support, election support, or equivalent tax-depreciation support documents.",
+            slot_details=tax_support_details or None,
         )
     )
 

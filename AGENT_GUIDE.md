@@ -400,17 +400,22 @@ Supported posting shapes:
 - Cash/card purchase: debit fixed asset, credit the supplied financial account.
 - Owner-paid non-reimbursable purchase: debit fixed asset, credit `3000 Owner Contributions`.
 - Owner-paid reimbursable purchase: debit fixed asset, credit `2300 Reimbursement Payable`.
+- Never pass revenue, expense, equity, or liability accounts through `--payment-account`; use the explicit owner-paid flags for owner funding.
 
 Book depreciation:
 - Straight-line monthly depreciation starts in the placed-in-service month.
 - `period close` posts missing book depreciation before the close lock and close snapshot are written.
 - The generated entry is dated `period_end` with source type `book_depreciation`.
 - Do not manually duplicate book-depreciation entries for assets already in the register.
+- `business-use-percent` does not reduce GAAP/book depreciation basis; it is retained for advisory tax-basis reporting.
+- `asset update --status inactive` is not a disposal or retirement workflow and must not be used to stop depreciation.
 
 Tax depreciation:
 - Use `asset tax set` only for CPA-directed, operator-entered support facts.
 - Tax depreciation does not post to the accrual ledger and does not change GAAP/book P&L.
+- Tax depreciation cannot be recorded for a tax year before the asset is placed in service.
 - Section 179, bonus depreciation, MACRS eligibility, recapture, and business-use tax treatment remain CPA/tax-preparer judgment.
+- Add real `tax_depreciation_support` documents linked to the asset; the operator-entered tax depreciation record is not itself supporting evidence.
 
 ```bash
 uv run clawbooks --ledger /ledger --json asset tax set \
