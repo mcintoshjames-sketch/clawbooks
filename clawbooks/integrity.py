@@ -17,6 +17,10 @@ from clawbooks.exceptions import AppError
 from clawbooks.ledger import (
     FINANCIAL_SUBTYPES,
     P_AND_L_KINDS,
+    asset_depreciable_basis,
+    asset_tax_basis,
+    book_depreciation_expected_through,
+    book_depreciation_posted_through,
     close_period,
     entry_has_immediate_cash_pnl,
     get_active_lock,
@@ -24,16 +28,33 @@ from clawbooks.ledger import (
     is_immediate_cash_source_line,
     period_status,
 )
-from clawbooks.models import AuditEvent, CloseSnapshot, Document, JournalEntry, JournalLine, PeriodLock, ReconciliationSession, ReviewBlocker, SettlementApplication
+from clawbooks.models import (
+    AssetBookDepreciationPosting,
+    AssetTaxDepreciation,
+    AuditEvent,
+    CloseSnapshot,
+    Document,
+    FixedAsset,
+    JournalEntry,
+    JournalLine,
+    PeriodLock,
+    ReconciliationSession,
+    ReviewBlocker,
+    SettlementApplication,
+)
 from clawbooks.reports import (
     balance_sheet,
+    book_depreciation_report,
     cash_basis_snapshot,
     cash_flow,
+    depreciation_difference_report,
     document_checklist,
     equity_rollforward,
+    fixed_assets_report,
     general_ledger,
     pnl,
     reconciliation_summary,
+    tax_depreciation_report,
     tax_liabilities,
     tax_rollforward,
     trial_balance,
@@ -50,6 +71,10 @@ COMPACT_REPORT_NAMES = (
     "tax_liabilities",
     "tax_rollforward",
     "equity_rollforward",
+    "fixed_assets",
+    "book_depreciation",
+    "tax_depreciation",
+    "depreciation_difference",
 )
 HEAVY_ARTIFACT_NAMES = ("general_ledger", "reconciliation_coverage")
 
@@ -111,7 +136,12 @@ def _snapshot_reports(
         "tax_liabilities": tax_liabilities(session, as_of=period_end),
         "tax_rollforward": tax_rollforward(session, period_start=period_start, period_end=period_end),
         "equity_rollforward": equity_rollforward(session, period_start=period_start, period_end=period_end),
+        "fixed_assets": fixed_assets_report(session, as_of=period_end),
+        "book_depreciation": book_depreciation_report(session, period_start=period_start, period_end=period_end),
     }
+    if _is_full_calendar_year(period_start, period_end):
+        compact_reports["tax_depreciation"] = tax_depreciation_report(session, year=period_end.year)
+        compact_reports["depreciation_difference"] = depreciation_difference_report(session, year=period_end.year)
     heavy_artifacts = {
         "general_ledger": general_ledger(session, period_start=period_start, period_end=period_end, include_line_ids=True),
         "reconciliation_coverage": reconciliation_summary(session, period_start=period_start, period_end=period_end),
@@ -382,6 +412,21 @@ def audit_period(
 
     blocking_findings: list[dict[str, object]] = []
     advisory_findings: list[dict[str, object]] = []
+    depreciation_preview = book_depreciation_report(session, period_start=period_start, period_end=period_end)
+    missing_depreciation = [
+        row for row in depreciation_preview["rows"] if row.get("missing_book_depreciation_cents", 0) > 0
+    ]
+    if missing_depreciation:
+        advisory_findings.append(
+            _finding(
+                "book_depreciation_would_post",
+                severity="medium",
+                category="fixed_assets",
+                title="Book depreciation would be posted during period close",
+                message="Active depreciable assets have unposted book depreciation for this close window.",
+                data={"rows": missing_depreciation},
+            )
+        )
     nested = session.begin_nested()
     try:
         try:
@@ -781,6 +826,119 @@ def _settlement_findings(applications: list[SettlementApplication]) -> list[dict
     return findings
 
 
+def _asset_integrity_findings(session: Session) -> list[dict[str, object]]:
+    findings: list[dict[str, object]] = []
+    assets = list(
+        session.scalars(
+            select(FixedAsset)
+            .options(
+                selectinload(FixedAsset.source_journal_entry).selectinload(JournalEntry.lines).selectinload(JournalLine.account),
+                selectinload(FixedAsset.asset_account),
+            )
+            .order_by(FixedAsset.id)
+        )
+    )
+    for asset in assets:
+        source_entry = asset.source_journal_entry
+        asset_line_total = sum(line.amount_cents for line in source_entry.lines if line.account_id == asset.asset_account_id)
+        if asset_line_total != asset.cost_cents:
+            findings.append(
+                _finding(
+                    f"fixed_asset_source_mismatch::{asset.id}",
+                    severity="high",
+                    category="fixed_assets",
+                    title="Fixed asset cost does not tie to its source capitalization journal",
+                    message="The source journal must debit the fixed-asset account for the recorded asset cost.",
+                    data={
+                        "asset_id": asset.id,
+                        "source_journal_entry_id": asset.source_journal_entry_id,
+                        "asset_account_id": asset.asset_account_id,
+                        "recorded_cost_cents": asset.cost_cents,
+                        "source_asset_line_total_cents": asset_line_total,
+                    },
+                )
+            )
+        posted_book_depreciation = book_depreciation_posted_through(session, asset.id, as_of=date(9999, 12, 31))
+        depreciable_basis = asset_depreciable_basis(asset)
+        if posted_book_depreciation > depreciable_basis:
+            findings.append(
+                _finding(
+                    f"fixed_asset_book_overdepreciated::{asset.id}",
+                    severity="high",
+                    category="fixed_assets",
+                    title="Posted book depreciation exceeds depreciable basis",
+                    message="Accumulated book depreciation must not exceed cost less salvage after business-use allocation.",
+                    data={
+                        "asset_id": asset.id,
+                        "posted_book_depreciation_cents": posted_book_depreciation,
+                        "depreciable_basis_cents": depreciable_basis,
+                    },
+                )
+            )
+        tax_basis = asset_tax_basis(asset)
+        tax_depreciation = int(
+            session.scalar(
+                select(func.coalesce(func.sum(AssetTaxDepreciation.amount_cents), 0)).where(
+                    AssetTaxDepreciation.asset_id == asset.id
+                )
+            )
+            or 0
+        )
+        if tax_depreciation > tax_basis:
+            findings.append(
+                _finding(
+                    f"fixed_asset_tax_overdepreciated::{asset.id}",
+                    severity="high",
+                    category="fixed_assets",
+                    title="Tax depreciation exceeds tax basis",
+                    message="Operator-entered advisory tax depreciation cannot reduce tax basis below zero.",
+                    data={
+                        "asset_id": asset.id,
+                        "tax_depreciation_cents": tax_depreciation,
+                        "tax_basis_cents": tax_basis,
+                    },
+                )
+            )
+    postings = list(
+        session.scalars(
+            select(AssetBookDepreciationPosting)
+            .options(selectinload(AssetBookDepreciationPosting.journal_entry).selectinload(JournalEntry.lines))
+            .order_by(AssetBookDepreciationPosting.id)
+        )
+    )
+    for posting in postings:
+        entry = posting.journal_entry
+        if entry.source_type != "book_depreciation":
+            findings.append(
+                _finding(
+                    f"fixed_asset_depreciation_posting_source::{posting.id}",
+                    severity="high",
+                    category="fixed_assets",
+                    title="Book depreciation posting points at a non-depreciation journal entry",
+                    message="Asset book-depreciation posting records must point at generated book_depreciation journal entries.",
+                    data={"posting_id": posting.id, "journal_entry_id": posting.journal_entry_id, "source_type": entry.source_type},
+                )
+            )
+        entry_debits = sum(line.amount_cents for line in entry.lines if line.amount_cents > 0)
+        if entry_debits != posting.amount_cents:
+            findings.append(
+                _finding(
+                    f"fixed_asset_depreciation_posting_amount::{posting.id}",
+                    severity="high",
+                    category="fixed_assets",
+                    title="Book depreciation posting amount does not tie to its journal entry",
+                    message="The generated depreciation journal debit total must equal the asset posting amount.",
+                    data={
+                        "posting_id": posting.id,
+                        "journal_entry_id": posting.journal_entry_id,
+                        "posting_amount_cents": posting.amount_cents,
+                        "journal_debit_amount_cents": entry_debits,
+                    },
+                )
+            )
+    return findings
+
+
 def _full_doctor(session: Session, *, ledger_dir: Path, config: AppConfig, year: int) -> dict[str, object]:
     findings: list[dict[str, object]] = []
 
@@ -801,6 +959,7 @@ def _full_doctor(session: Session, *, ledger_dir: Path, config: AppConfig, year:
         )
     )
     findings.extend(_settlement_findings(applications))
+    findings.extend(_asset_integrity_findings(session))
 
     for period_start, period_end in _candidate_closed_intervals(session):
         if not _interval_is_effectively_closed(session, period_start=period_start, period_end=period_end):
@@ -818,6 +977,21 @@ def _full_doctor(session: Session, *, ledger_dir: Path, config: AppConfig, year:
                 )
             )
         audit = audit_period(session, ledger_dir=ledger_dir, config=config, period_start=period_start, period_end=period_end)
+        depreciation_report = book_depreciation_report(session, period_start=period_start, period_end=period_end)
+        missing_depreciation = [
+            row for row in depreciation_report["rows"] if row.get("missing_book_depreciation_cents", 0) > 0
+        ]
+        if missing_depreciation:
+            findings.append(
+                _finding(
+                    f"closed_period_missing_book_depreciation::{period_start}::{period_end}",
+                    severity="high",
+                    category="fixed_assets",
+                    title="Closed period is missing required book depreciation postings",
+                    message="Closed periods with active depreciable assets must have the book depreciation postings that close would create.",
+                    data={"period_start": period_start, "period_end": period_end, "rows": missing_depreciation},
+                )
+            )
         for blocking in audit["blocking_findings"]:
             findings.append(
                 _finding(

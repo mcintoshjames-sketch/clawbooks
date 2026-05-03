@@ -82,6 +82,76 @@ class JournalLine(Base):
     reconciliation_matches: Mapped[list["ReconciliationMatch"]] = relationship(back_populates="journal_line")
 
 
+class FixedAsset(Base):
+    __tablename__ = "fixed_assets"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    description: Mapped[str] = mapped_column(String(500))
+    vendor: Mapped[str | None] = mapped_column(String(255), default=None)
+    purchase_date: Mapped[date] = mapped_column(Date, index=True)
+    placed_in_service_date: Mapped[date] = mapped_column(Date, index=True)
+    cost_cents: Mapped[int] = mapped_column(Integer)
+    asset_account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"))
+    accumulated_depreciation_account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"))
+    depreciation_expense_account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"))
+    useful_life_months: Mapped[int] = mapped_column(Integer)
+    salvage_value_cents: Mapped[int] = mapped_column(Integer, default=0)
+    business_use_percent: Mapped[int] = mapped_column(Integer, default=10000)
+    status: Mapped[str] = mapped_column(String(32), default="active", index=True)
+    source_journal_entry_id: Mapped[int] = mapped_column(ForeignKey("journal_entries.id"), index=True)
+    notes: Mapped[str | None] = mapped_column(Text, default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    asset_account: Mapped[Account] = relationship(foreign_keys=[asset_account_id])
+    accumulated_depreciation_account: Mapped[Account] = relationship(foreign_keys=[accumulated_depreciation_account_id])
+    depreciation_expense_account: Mapped[Account] = relationship(foreign_keys=[depreciation_expense_account_id])
+    source_journal_entry: Mapped[JournalEntry] = relationship()
+    book_depreciation_postings: Mapped[list["AssetBookDepreciationPosting"]] = relationship(
+        back_populates="asset",
+        cascade="all, delete-orphan",
+    )
+    tax_depreciation_records: Mapped[list["AssetTaxDepreciation"]] = relationship(
+        back_populates="asset",
+        cascade="all, delete-orphan",
+    )
+
+
+class AssetBookDepreciationPosting(Base):
+    __tablename__ = "asset_book_depreciation_postings"
+    __table_args__ = (UniqueConstraint("asset_id", "period_start", "period_end", name="uq_asset_book_depr_period"),)
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    asset_id: Mapped[int] = mapped_column(ForeignKey("fixed_assets.id"), index=True)
+    period_start: Mapped[date] = mapped_column(Date, index=True)
+    period_end: Mapped[date] = mapped_column(Date, index=True)
+    journal_entry_id: Mapped[int] = mapped_column(ForeignKey("journal_entries.id"), index=True)
+    amount_cents: Mapped[int] = mapped_column(Integer)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    asset: Mapped[FixedAsset] = relationship(back_populates="book_depreciation_postings")
+    journal_entry: Mapped[JournalEntry] = relationship()
+
+
+class AssetTaxDepreciation(Base):
+    __tablename__ = "asset_tax_depreciation"
+    __table_args__ = (
+        UniqueConstraint("asset_id", "tax_year", "deduction_type", name="uq_asset_tax_depr_type_year"),
+    )
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    asset_id: Mapped[int] = mapped_column(ForeignKey("fixed_assets.id"), index=True)
+    tax_year: Mapped[int] = mapped_column(Integer, index=True)
+    deduction_type: Mapped[str] = mapped_column(String(32))
+    amount_cents: Mapped[int] = mapped_column(Integer)
+    business_use_percent: Mapped[int] = mapped_column(Integer, default=10000)
+    tax_basis_before_cents: Mapped[int] = mapped_column(Integer)
+    tax_basis_after_cents: Mapped[int] = mapped_column(Integer)
+    notes: Mapped[str | None] = mapped_column(Text, default=None)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+
+    asset: Mapped[FixedAsset] = relationship(back_populates="tax_depreciation_records")
+
+
 class SettlementApplication(Base):
     __tablename__ = "settlement_applications"
 

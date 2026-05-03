@@ -6,6 +6,7 @@ import shutil
 from collections import defaultdict
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta
+from decimal import Decimal, ROUND_HALF_UP
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -16,11 +17,14 @@ from clawbooks.defaults import DEFAULT_ACCOUNTS
 from clawbooks.exceptions import ComplianceError, ImportConflictError, LockedPeriodError, ReconciliationError, ValidationError
 from clawbooks.models import (
     Account,
+    AssetBookDepreciationPosting,
+    AssetTaxDepreciation,
     AuditEvent,
     Document,
     DocumentLink,
     ExternalEvent,
     ExternalEventRefreshHistory,
+    FixedAsset,
     ImportRun,
     JournalEntry,
     JournalLine,
@@ -49,7 +53,7 @@ from clawbooks.utils import json_dumps, parse_date, parse_money, read_csv_rows, 
 ACCOUNT_KINDS = {"asset", "liability", "equity", "revenue", "expense", "contra_revenue"}
 FINANCIAL_SUBTYPES = {"bank", "card", "stripe_clearing"}
 P_AND_L_KINDS = {"revenue", "expense", "contra_revenue"}
-SETTLEMENT_APPLICATION_TYPES = {"manual", "cash_receipt", "cash_disbursement", "owner_paid", "reimbursement_auto"}
+SETTLEMENT_APPLICATION_TYPES = {"manual", "cash_receipt", "cash_disbursement", "owner_paid", "reimbursement_auto", "reimbursement"}
 DOCUMENT_SCOPES = {"business", "owner"}
 STATEMENT_DOCUMENT_TYPES = {
     "bank": "bank_statement",
@@ -63,6 +67,7 @@ DOCUMENT_TYPES = {
     "contractor_w9",
     "estimated_tax_confirmation",
     "expense_receipt",
+    "fixed_asset_purchase",
     "illinois_sales_tax_payment",
     "illinois_sales_tax_return",
     "payroll_report",
@@ -167,6 +172,7 @@ def _resolve_document_targets(
     reconciliation_session_id: int | None,
     tax_obligation_code: str | None,
     import_run_id: int | None,
+    fixed_asset_id: int | None = None,
 ) -> list[tuple[str, int]]:
     targets: list[tuple[str, int]] = []
     if journal_entry_id is not None:
@@ -186,6 +192,10 @@ def _resolve_document_targets(
         if not session.get(ImportRun, import_run_id):
             raise ValidationError(f"Unknown import run: {import_run_id}")
         targets.append(("import_run", import_run_id))
+    if fixed_asset_id is not None:
+        if not session.get(FixedAsset, fixed_asset_id):
+            raise ValidationError(f"Unknown fixed asset: {fixed_asset_id}")
+        targets.append(("fixed_asset", fixed_asset_id))
     return targets
 
 
@@ -275,6 +285,7 @@ def create_document(
     reconciliation_session_id: int | None = None,
     tax_obligation_code: str | None = None,
     import_run_id: int | None = None,
+    fixed_asset_id: int | None = None,
 ) -> Document:
     _validate_document_metadata(
         document_type=document_type,
@@ -297,6 +308,7 @@ def create_document(
         reconciliation_session_id=reconciliation_session_id,
         tax_obligation_code=tax_obligation_code,
         import_run_id=import_run_id,
+        fixed_asset_id=fixed_asset_id,
     )
     document = Document(
         document_type=document_type,
@@ -339,6 +351,7 @@ def list_documents(
     reconciliation_session_id: int | None = None,
     tax_obligation_code: str | None = None,
     import_run_id: int | None = None,
+    fixed_asset_id: int | None = None,
 ) -> list[Document]:
     query = select(Document).options(selectinload(Document.links)).order_by(Document.tax_year.desc(), Document.created_at.desc(), Document.id.desc())
     if tax_year is not None:
@@ -348,7 +361,7 @@ def list_documents(
     if scope is not None:
         query = query.where(Document.scope == scope)
     documents = list(session.scalars(query))
-    if not any(value is not None for value in (journal_entry_id, reconciliation_session_id, tax_obligation_code, import_run_id)):
+    if not any(value is not None for value in (journal_entry_id, reconciliation_session_id, tax_obligation_code, import_run_id, fixed_asset_id)):
         return documents
 
     targets = _resolve_document_targets(
@@ -357,6 +370,7 @@ def list_documents(
         reconciliation_session_id=reconciliation_session_id,
         tax_obligation_code=tax_obligation_code,
         import_run_id=import_run_id,
+        fixed_asset_id=fixed_asset_id,
     )
     wanted = set(targets)
     return [
@@ -384,6 +398,7 @@ def update_document(
     reconciliation_session_id: int | None = None,
     tax_obligation_code: str | None = None,
     import_run_id: int | None = None,
+    fixed_asset_id: int | None = None,
 ) -> Document:
     document = session.scalar(select(Document).options(selectinload(Document.links)).where(Document.id == document_id))
     if not document:
@@ -425,6 +440,7 @@ def update_document(
         reconciliation_session_id=reconciliation_session_id,
         tax_obligation_code=tax_obligation_code,
         import_run_id=import_run_id,
+        fixed_asset_id=fixed_asset_id,
     )
     if clear_links or targets:
         _apply_document_links(document, targets, clear_links=clear_links)
@@ -563,6 +579,22 @@ def seed_defaults(session: Session, year: int) -> None:
                     created_at=utcnow(),
                 )
             )
+    else:
+        existing_codes = set(session.scalars(select(Account.code)))
+        for account in DEFAULT_ACCOUNTS:
+            if account["code"] in existing_codes:
+                continue
+            session.add(
+                Account(
+                    code=account["code"],
+                    name=account["name"],
+                    kind=account["kind"],
+                    subtype=account["subtype"],
+                    currency="USD",
+                    is_active=True,
+                    created_at=utcnow(),
+                )
+            )
     if not session.get(Setting, "ledger_version"):
         session.add(Setting(key="ledger_version", value_json=json.dumps({"version": 2})))
     if not session.get(Setting, "compliance_profile"):
@@ -584,12 +616,14 @@ def get_account(session: Session, code: str) -> Account:
 
 
 def infer_kind_from_subtype(subtype: str) -> str:
-    if subtype in {"bank", "stripe_clearing", "receivable"}:
+    if subtype in {"bank", "stripe_clearing", "receivable", "fixed_asset", "accumulated_depreciation"}:
         return "asset"
     if subtype in {"card", "tax_liability", "reimbursement"}:
         return "liability"
     if subtype == "equity":
         return "equity"
+    if subtype == "expense":
+        return "expense"
     raise ValidationError(f"Cannot infer account kind from subtype: {subtype}")
 
 
@@ -673,6 +707,29 @@ def ensure_interval_unlocked(session: Session, start: date, end: date) -> None:
                     "period_end": lock.period_end,
                 },
             )
+
+
+def interval_effectively_closed(session: Session, *, start: date, end: date) -> bool:
+    if end < start:
+        raise ValidationError("Interval end cannot be before interval start")
+    overlapping_locks = list(
+        session.scalars(
+            select(PeriodLock)
+            .where(PeriodLock.period_start <= end, PeriodLock.period_end >= start)
+            .order_by(PeriodLock.period_start, PeriodLock.period_end, PeriodLock.created_at, PeriodLock.id)
+        )
+    )
+    if not overlapping_locks:
+        return False
+    boundaries = {start, end + timedelta(days=1)}
+    for lock in overlapping_locks:
+        boundaries.add(max(start, lock.period_start))
+        boundaries.add(min(end + timedelta(days=1), lock.period_end + timedelta(days=1)))
+    for boundary in sorted(boundaries)[:-1]:
+        lock = get_active_lock(session, boundary)
+        if lock is None or lock.action != "close":
+            return False
+    return True
 
 
 def post_journal_entry(
@@ -911,6 +968,401 @@ def record_expense(
     }
 
 
+ASSET_STATUSES = {"active", "inactive"}
+TAX_DEPRECIATION_TYPES = {"section_179", "bonus", "macrs", "other"}
+
+
+def _parse_percent_to_basis_points(value: str | None) -> int:
+    if value is None:
+        return 10000
+    parsed = (Decimal(value.strip().rstrip("%")) * Decimal("100")).quantize(Decimal("1"), rounding=ROUND_HALF_UP)
+    basis_points = int(parsed)
+    if basis_points < 0 or basis_points > 10000:
+        raise ValidationError("Business-use percent must be between 0 and 100")
+    return basis_points
+
+
+def _asset_business_basis(cost_cents: int, business_use_percent: int) -> int:
+    return int((Decimal(cost_cents) * Decimal(business_use_percent) / Decimal(10000)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+
+
+def asset_depreciable_basis(asset: FixedAsset) -> int:
+    base = max(asset.cost_cents - asset.salvage_value_cents, 0)
+    return _asset_business_basis(base, asset.business_use_percent)
+
+
+def asset_tax_basis(asset: FixedAsset) -> int:
+    return _asset_business_basis(asset.cost_cents, asset.business_use_percent)
+
+
+def _month_start(value: date) -> date:
+    return date(value.year, value.month, 1)
+
+
+def _next_month(value: date) -> date:
+    return date(value.year + (1 if value.month == 12 else 0), 1 if value.month == 12 else value.month + 1, 1)
+
+
+def _asset_schedule_rows(asset: FixedAsset, *, through_date: date) -> list[dict[str, object]]:
+    depreciable_basis = asset_depreciable_basis(asset)
+    if asset.useful_life_months <= 0 or depreciable_basis <= 0:
+        return []
+    month = _month_start(asset.placed_in_service_date)
+    if month > through_date:
+        return []
+    monthly = int((Decimal(depreciable_basis) / Decimal(asset.useful_life_months)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
+    rows: list[dict[str, object]] = []
+    accumulated = 0
+    for index in range(asset.useful_life_months):
+        if month > through_date:
+            break
+        remaining_months = asset.useful_life_months - index
+        if remaining_months == 1:
+            amount = depreciable_basis - accumulated
+        else:
+            amount = min(monthly, depreciable_basis - accumulated)
+        if amount <= 0:
+            break
+        accumulated += amount
+        rows.append(
+            {
+                "asset_id": asset.id,
+                "period_start": month,
+                "period_end": date(month.year, month.month, 28) + timedelta(days=4),
+                "month": month.isoformat(),
+                "amount_cents": amount,
+                "accumulated_cents": accumulated,
+            }
+        )
+        rows[-1]["period_end"] = rows[-1]["period_end"] - timedelta(days=rows[-1]["period_end"].day)
+        month = _next_month(month)
+    return rows
+
+
+def book_depreciation_expected_through(asset: FixedAsset, *, as_of: date) -> int:
+    return sum(int(row["amount_cents"]) for row in _asset_schedule_rows(asset, through_date=as_of))
+
+
+def book_depreciation_expected_for_period(asset: FixedAsset, *, period_start: date, period_end: date) -> int:
+    return sum(
+        int(row["amount_cents"])
+        for row in _asset_schedule_rows(asset, through_date=period_end)
+        if row["period_start"] >= _month_start(period_start) and row["period_start"] <= period_end
+    )
+
+
+def book_depreciation_posted_through(session: Session, asset_id: int, *, as_of: date) -> int:
+    return int(
+        session.scalar(
+            select(func.coalesce(func.sum(AssetBookDepreciationPosting.amount_cents), 0)).where(
+                AssetBookDepreciationPosting.asset_id == asset_id,
+                AssetBookDepreciationPosting.period_end <= as_of,
+            )
+        )
+        or 0
+    )
+
+
+def book_depreciation_posted_for_period(session: Session, asset_id: int, *, period_start: date, period_end: date) -> int:
+    return int(
+        session.scalar(
+            select(func.coalesce(func.sum(AssetBookDepreciationPosting.amount_cents), 0)).where(
+                AssetBookDepreciationPosting.asset_id == asset_id,
+                AssetBookDepreciationPosting.period_start <= period_end,
+                AssetBookDepreciationPosting.period_end >= period_start,
+            )
+        )
+        or 0
+    )
+
+
+def add_fixed_asset(
+    session: Session,
+    *,
+    ledger_dir: Path,
+    description: str,
+    vendor: str | None,
+    purchase_date: date,
+    placed_in_service_date: date,
+    cost: str,
+    asset_account_code: str = "1500",
+    accumulated_depreciation_account_code: str = "1590",
+    depreciation_expense_account_code: str = "5170",
+    payment_account_code: str | None = "1000",
+    paid_personally: bool = False,
+    reimbursement: bool = False,
+    useful_life_months: int = 36,
+    salvage_value: str = "0.00",
+    business_use_percent: str | None = None,
+    notes: str | None = None,
+    receipt_path: Path | None = None,
+    dry_run: bool = False,
+) -> dict[str, object]:
+    cost_cents = parse_money(cost)
+    salvage_cents = parse_money(salvage_value)
+    if cost_cents <= 0:
+        raise ValidationError("Fixed asset cost must be positive")
+    if salvage_cents < 0:
+        raise ValidationError("Salvage value cannot be negative")
+    if salvage_cents >= cost_cents:
+        raise ValidationError("Salvage value must be less than asset cost")
+    if useful_life_months <= 0:
+        raise ValidationError("Useful life months must be positive")
+    if placed_in_service_date < purchase_date:
+        raise ValidationError("Placed-in-service date cannot be before purchase date")
+    business_use_basis_points = _parse_percent_to_basis_points(business_use_percent)
+    if business_use_basis_points <= 0:
+        raise ValidationError("Business-use percent must be greater than zero")
+
+    asset_account = get_account(session, asset_account_code)
+    accumulated_account = get_account(session, accumulated_depreciation_account_code)
+    expense_account = get_account(session, depreciation_expense_account_code)
+    if asset_account.kind != "asset" or asset_account.subtype != "fixed_asset":
+        raise ValidationError("Asset account must be an asset account with subtype fixed_asset")
+    if accumulated_account.kind != "asset" or accumulated_account.subtype != "accumulated_depreciation":
+        raise ValidationError("Accumulated depreciation account must be an asset account with subtype accumulated_depreciation")
+    if expense_account.kind != "expense":
+        raise ValidationError("Depreciation expense account must be an expense account")
+
+    offset_code = payment_account_code
+    if paid_personally:
+        offset_code = "2300" if reimbursement else "3000"
+    if not offset_code:
+        raise ValidationError("Payment account is required unless --paid-personally is set")
+    get_account(session, offset_code)
+
+    entry = post_journal_entry(
+        session,
+        entry_date=purchase_date,
+        description=f"Fixed asset purchase: {description}",
+        lines=[
+            JournalLineInput(asset_account_code, cost_cents, description),
+            JournalLineInput(offset_code, -cost_cents, vendor or description),
+        ],
+        source_type="fixed_asset_purchase",
+        source_ref=vendor,
+    )
+    asset = FixedAsset(
+        description=description,
+        vendor=vendor,
+        purchase_date=purchase_date,
+        placed_in_service_date=placed_in_service_date,
+        cost_cents=cost_cents,
+        asset_account_id=asset_account.id,
+        accumulated_depreciation_account_id=accumulated_account.id,
+        depreciation_expense_account_id=expense_account.id,
+        useful_life_months=useful_life_months,
+        salvage_value_cents=salvage_cents,
+        business_use_percent=business_use_basis_points,
+        status="active",
+        source_journal_entry_id=entry.id,
+        notes=notes,
+        created_at=utcnow(),
+    )
+    session.add(asset)
+    session.flush()
+    entry.source_ref = f"fixed_asset:{asset.id}"
+    document_id = None
+    if receipt_path:
+        document = create_document(
+            session,
+            ledger_dir=ledger_dir,
+            source_path=receipt_path,
+            document_type="fixed_asset_purchase",
+            tax_year=purchase_date.year,
+            scope="business",
+            period_start=purchase_date,
+            period_end=purchase_date,
+            notes=f"Purchase support for fixed asset {asset.id}",
+            created_via="asset",
+            dry_run=dry_run,
+            journal_entry_id=entry.id,
+            fixed_asset_id=asset.id,
+        )
+        document_id = document.id
+    session.flush()
+    return {
+        "asset_id": asset.id,
+        "entry_id": entry.id,
+        "document_id": document_id,
+        "cost_cents": cost_cents,
+        "offset_account_code": offset_code,
+        "dry_run": dry_run,
+    }
+
+
+def list_fixed_assets(session: Session, *, include_inactive: bool = False) -> list[FixedAsset]:
+    query = (
+        select(FixedAsset)
+        .options(
+            selectinload(FixedAsset.asset_account),
+            selectinload(FixedAsset.accumulated_depreciation_account),
+            selectinload(FixedAsset.depreciation_expense_account),
+        )
+        .order_by(FixedAsset.purchase_date, FixedAsset.id)
+    )
+    if not include_inactive:
+        query = query.where(FixedAsset.status == "active")
+    return list(session.scalars(query))
+
+
+def get_fixed_asset(session: Session, asset_id: int) -> FixedAsset:
+    asset = session.scalar(
+        select(FixedAsset)
+        .options(
+            selectinload(FixedAsset.asset_account),
+            selectinload(FixedAsset.accumulated_depreciation_account),
+            selectinload(FixedAsset.depreciation_expense_account),
+        )
+        .where(FixedAsset.id == asset_id)
+    )
+    if not asset:
+        raise ValidationError(f"Unknown fixed asset: {asset_id}")
+    return asset
+
+
+def update_fixed_asset(
+    session: Session,
+    *,
+    asset_id: int,
+    description: str | None = None,
+    vendor: str | object = UNSET,
+    notes: str | object = UNSET,
+    status: str | None = None,
+) -> FixedAsset:
+    asset = get_fixed_asset(session, asset_id)
+    ensure_interval_unlocked(session, asset.purchase_date, utcnow().date())
+    if description is not None:
+        asset.description = description
+    if vendor is not UNSET:
+        asset.vendor = vendor
+    if notes is not UNSET:
+        asset.notes = notes
+    if status is not None:
+        if status not in ASSET_STATUSES:
+            raise ValidationError(f"Unsupported fixed asset status: {status}")
+        asset.status = status
+    session.flush()
+    return get_fixed_asset(session, asset_id)
+
+
+def set_asset_tax_depreciation(
+    session: Session,
+    *,
+    asset_id: int,
+    tax_year: int,
+    deduction_type: str,
+    amount: str,
+    business_use_percent: str | None = None,
+    notes: str | None = None,
+) -> AssetTaxDepreciation:
+    if deduction_type not in TAX_DEPRECIATION_TYPES:
+        raise ValidationError(f"Unsupported tax depreciation deduction type: {deduction_type}")
+    tax_year_start = date(tax_year, 1, 1)
+    tax_year_end = date(tax_year, 12, 31)
+    if interval_effectively_closed(session, start=tax_year_start, end=tax_year_end):
+        raise LockedPeriodError(
+            f"Tax year {tax_year} is fully closed; reopen the relevant year-end close before editing advisory tax depreciation",
+            data={"period_start": tax_year_start, "period_end": tax_year_end},
+        )
+    asset = get_fixed_asset(session, asset_id)
+    amount_cents = parse_money(amount)
+    if amount_cents < 0:
+        raise ValidationError("Tax depreciation amount cannot be negative")
+    business_use_basis_points = _parse_percent_to_basis_points(business_use_percent) if business_use_percent is not None else asset.business_use_percent
+    tax_basis_cents = _asset_business_basis(asset.cost_cents, business_use_basis_points)
+    existing = session.scalar(
+        select(AssetTaxDepreciation).where(
+            AssetTaxDepreciation.asset_id == asset_id,
+            AssetTaxDepreciation.tax_year == tax_year,
+            AssetTaxDepreciation.deduction_type == deduction_type,
+        )
+    )
+    prior_depreciation_cents = int(
+        session.scalar(
+            select(func.coalesce(func.sum(AssetTaxDepreciation.amount_cents), 0)).where(
+                AssetTaxDepreciation.asset_id == asset_id,
+                AssetTaxDepreciation.id != (existing.id if existing else -1),
+            )
+        )
+        or 0
+    )
+    basis_before = tax_basis_cents - prior_depreciation_cents
+    if amount_cents > basis_before:
+        raise ValidationError(
+            "Tax depreciation cannot reduce tax basis below zero",
+            data={"tax_basis_before_cents": basis_before, "requested_amount_cents": amount_cents},
+        )
+    if existing:
+        existing.amount_cents = amount_cents
+        existing.business_use_percent = business_use_basis_points
+        existing.tax_basis_before_cents = basis_before
+        existing.tax_basis_after_cents = basis_before - amount_cents
+        existing.notes = notes
+        record = existing
+    else:
+        record = AssetTaxDepreciation(
+            asset_id=asset_id,
+            tax_year=tax_year,
+            deduction_type=deduction_type,
+            amount_cents=amount_cents,
+            business_use_percent=business_use_basis_points,
+            tax_basis_before_cents=basis_before,
+            tax_basis_after_cents=basis_before - amount_cents,
+            notes=notes,
+            created_at=utcnow(),
+        )
+        session.add(record)
+    session.flush()
+    return record
+
+
+def auto_post_book_depreciation(session: Session, *, period_start: date, period_end: date) -> list[dict[str, object]]:
+    ensure_interval_unlocked(session, period_start, period_end)
+    results: list[dict[str, object]] = []
+    assets = list_fixed_assets(session, include_inactive=False)
+    for asset in assets:
+        if asset.placed_in_service_date > period_end:
+            continue
+        expected_through = book_depreciation_expected_through(asset, as_of=period_end)
+        already_posted = book_depreciation_posted_through(session, asset.id, as_of=period_end)
+        amount_cents = expected_through - already_posted
+        if amount_cents <= 0:
+            continue
+        existing = session.scalar(
+            select(AssetBookDepreciationPosting).where(
+                AssetBookDepreciationPosting.asset_id == asset.id,
+                AssetBookDepreciationPosting.period_start == period_start,
+                AssetBookDepreciationPosting.period_end == period_end,
+            )
+        )
+        if existing:
+            continue
+        entry = post_journal_entry(
+            session,
+            entry_date=period_end,
+            description=f"Book depreciation: {asset.description}",
+            lines=[
+                JournalLineInput(asset.depreciation_expense_account.code, amount_cents, f"Asset {asset.id} book depreciation"),
+                JournalLineInput(asset.accumulated_depreciation_account.code, -amount_cents, f"Asset {asset.id} accumulated depreciation"),
+            ],
+            source_type="book_depreciation",
+            source_ref=f"fixed_asset:{asset.id}:{period_start.isoformat()}:{period_end.isoformat()}",
+        )
+        posting = AssetBookDepreciationPosting(
+            asset_id=asset.id,
+            period_start=period_start,
+            period_end=period_end,
+            journal_entry_id=entry.id,
+            amount_cents=amount_cents,
+            created_at=utcnow(),
+        )
+        session.add(posting)
+        results.append({"asset_id": asset.id, "journal_entry_id": entry.id, "amount_cents": amount_cents})
+    session.flush()
+    return results
+
+
 def reverse_entry(session: Session, *, entry_id: int, reversal_date: date, reason: str) -> dict[str, object]:
     original = session.scalar(
         select(JournalEntry)
@@ -919,6 +1371,10 @@ def reverse_entry(session: Session, *, entry_id: int, reversal_date: date, reaso
     )
     if not original:
         raise ValidationError(f"Unknown journal entry: {entry_id}")
+    if original.source_type == "book_depreciation":
+        raise ValidationError("Book depreciation entries are generated from the fixed-asset register and cannot be reversed directly")
+    if original.source_type == "fixed_asset_purchase" and session.scalar(select(FixedAsset.id).where(FixedAsset.source_journal_entry_id == entry_id)):
+        raise ValidationError("Fixed asset capitalization entries cannot be reversed while a fixed asset record depends on them")
     if original.reversal_of_entry_id:
         raise ValidationError("Cannot reverse an entry that is already a reversal")
     if session.scalar(select(JournalEntry.id).where(JournalEntry.reversal_of_entry_id == entry_id)):
@@ -2625,6 +3081,8 @@ def close_period(
             data={"account_codes": missing, "coverage_rows": coverage["coverage_rows"]},
         )
 
+    depreciation_postings = auto_post_book_depreciation(session, period_start=period_start, period_end=period_end)
+
     session.add(
         PeriodLock(
             period_start=period_start,
@@ -2652,6 +3110,7 @@ def close_period(
         "period_end": period_end,
         "status": "closed",
         "close_snapshot_id": snapshot.id,
+        "book_depreciation_postings": depreciation_postings,
     }
 
 

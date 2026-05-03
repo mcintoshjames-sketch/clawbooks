@@ -31,6 +31,9 @@ def legacyize_ledger(ledger: Path) -> None:
     connection = sqlite3.connect(ledger / "ledger.db")
     try:
         connection.execute("DROP TABLE alembic_version")
+        connection.execute("DROP TABLE IF EXISTS asset_tax_depreciation")
+        connection.execute("DROP TABLE IF EXISTS asset_book_depreciation_postings")
+        connection.execute("DROP TABLE IF EXISTS fixed_assets")
         connection.execute("DROP TABLE close_snapshots")
         connection.execute("DROP TABLE audit_events")
         for column in ("review_required", "review_message", "review_acknowledged_at", "cash_basis_included"):

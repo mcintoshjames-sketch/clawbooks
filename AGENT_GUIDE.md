@@ -381,6 +381,54 @@ Interpretation rules:
 - if cash-basis `P&L` returns `ignored_invalid_settlement_applications`, the ledger contained legacy invalid settlement structure and the report suppressed it to avoid double counting
 - do not “fix” excluded cash-basis lines by guessing
 
+## Fixed Assets and Book/Tax Depreciation
+
+Use `asset add` for capital equipment. Do not record a computer or other fixed asset as an ordinary expense merely because it may receive accelerated tax treatment.
+
+```bash
+uv run clawbooks --ledger /ledger --json asset add \
+  --description "Development computer" \
+  --vendor Apple \
+  --purchase-date 2026-05-03 \
+  --placed-in-service-date 2026-05-03 \
+  --cost 2400.00 \
+  --useful-life-months 36 \
+  --payment-account 1000
+```
+
+Supported posting shapes:
+- Cash/card purchase: debit fixed asset, credit the supplied financial account.
+- Owner-paid non-reimbursable purchase: debit fixed asset, credit `3000 Owner Contributions`.
+- Owner-paid reimbursable purchase: debit fixed asset, credit `2300 Reimbursement Payable`.
+
+Book depreciation:
+- Straight-line monthly depreciation starts in the placed-in-service month.
+- `period close` posts missing book depreciation before the close lock and close snapshot are written.
+- The generated entry is dated `period_end` with source type `book_depreciation`.
+- Do not manually duplicate book-depreciation entries for assets already in the register.
+
+Tax depreciation:
+- Use `asset tax set` only for CPA-directed, operator-entered support facts.
+- Tax depreciation does not post to the accrual ledger and does not change GAAP/book P&L.
+- Section 179, bonus depreciation, MACRS eligibility, recapture, and business-use tax treatment remain CPA/tax-preparer judgment.
+
+```bash
+uv run clawbooks --ledger /ledger --json asset tax set \
+  --asset-id 1 \
+  --year 2026 \
+  --deduction-type section_179 \
+  --amount 2400.00
+```
+
+Review depreciation reports before accountant packet export:
+
+```bash
+uv run clawbooks --ledger /ledger --json report fixed-assets --as-of 2026-12-31
+uv run clawbooks --ledger /ledger --json report book-depreciation --period-start 2026-01-01 --period-end 2026-12-31
+uv run clawbooks --ledger /ledger --json report tax-depreciation --year 2026
+uv run clawbooks --ledger /ledger --json report depreciation-difference --year 2026
+```
+
 ## Period Close
 
 Close only after:

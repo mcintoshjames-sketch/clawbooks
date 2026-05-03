@@ -23,14 +23,18 @@ from clawbooks.ledger import (
 from clawbooks.models import Account, ImportRun, PeriodLock, ReconciliationSession, ReviewBlocker, TaxObligation
 from clawbooks.reports import (
     balance_sheet,
+    book_depreciation_report,
     cash_flow,
+    depreciation_difference_report,
     document_checklist,
     equity_rollforward,
     export_accountant_packet,
     export_bundle,
     export_year_end,
+    fixed_assets_report,
     general_ledger,
     pnl,
+    tax_depreciation_report,
     tax_liabilities,
     tax_rollforward,
     trial_balance,
@@ -59,6 +63,10 @@ REPORTS: dict[str, ReportDescriptor] = {
     "tax_liabilities": ReportDescriptor("tax_liabilities", "Tax Liabilities", "as_of", "CUSTOM"),
     "equity_rollforward": ReportDescriptor("equity_rollforward", "Equity Rollforward", "range", "YTD"),
     "tax_rollforward": ReportDescriptor("tax_rollforward", "Tax Rollforward", "range", "QTD"),
+    "fixed_assets": ReportDescriptor("fixed_assets", "Fixed Assets", "as_of", "CUSTOM"),
+    "book_depreciation": ReportDescriptor("book_depreciation", "Book Depreciation", "range", "YTD"),
+    "tax_depreciation": ReportDescriptor("tax_depreciation", "Tax Depreciation", "range", "YTD"),
+    "depreciation_difference": ReportDescriptor("depreciation_difference", "Depreciation Difference", "range", "YTD"),
 }
 
 
@@ -198,6 +206,14 @@ class TuiFacade:
                 payload = tax_liabilities(session, as_of=as_of)
             elif report_key == "equity_rollforward":
                 payload = equity_rollforward(session, period_start=start, period_end=end)
+            elif report_key == "fixed_assets":
+                payload = fixed_assets_report(session, as_of=as_of)
+            elif report_key == "book_depreciation":
+                payload = book_depreciation_report(session, period_start=start, period_end=end)
+            elif report_key == "tax_depreciation":
+                payload = tax_depreciation_report(session, year=end.year)
+            elif report_key == "depreciation_difference":
+                payload = depreciation_difference_report(session, year=end.year)
             else:
                 payload = tax_rollforward(session, period_start=start, period_end=end)
 
@@ -343,6 +359,7 @@ class TuiFacade:
             HelpCommand("Import CSV", "CSV imports stay in the CLI in v1.", f"{prefix} import csv --account-code 1000 --csv-path /path/to/file.csv --profile-path /path/to/profile.json --statement-starting-balance 0.00 --statement-ending-balance 0.00 --dry-run"),
             HelpCommand("Reconcile", "Use candidate discovery and amount-based matching in the CLI; void mistaken sessions instead of replacing them in place.", f"{prefix} reconcile candidates --session-id 1"),
             HelpCommand("Settlement", "Explicit settlement drives supported cash-basis reporting; exact one-source owner reimbursements auto-link, everything else stays manual.", f"{prefix} settlement apply --source-line-id 10 --settlement-line-id 42 --amount 100.00"),
+            HelpCommand("Fixed assets", "Capitalize assets; book depreciation posts on close and tax depreciation stays advisory.", f"{prefix} asset add --description 'Computer' --purchase-date YYYY-MM-DD --cost 0.00 --useful-life-months 36"),
             HelpCommand("Review blockers", "List open blockers first; retry refreshes current Stripe facts instead of replaying stale payloads.", f"{prefix} review list --status open"),
             HelpCommand("Compliance profile", "Checklist applicability comes from the compliance profile.", f"{prefix} compliance profile show"),
             HelpCommand("Sales-tax slots", "Sales-tax payment completeness depends on explicit filing-slot expectations.", f"{prefix} compliance sales-tax-slot list --year YYYY"),
@@ -521,6 +538,58 @@ class TuiFacade:
                 Metric("Ending Equity", format_money(int(payload["totals"]["ending_equity"]))),
             ]
             sections = [TableSection("Equity Rollforward", ["component", "title", "amount_cents"], payload["rows"], "No equity activity.")]
+        elif descriptor.key == "fixed_assets":
+            metrics = [
+                Metric("Assets", str(len(payload["rows"]))),
+                Metric("Cost", format_money(int(payload["totals"]["cost_cents"]))),
+                Metric("Book Basis", format_money(int(payload["totals"]["book_basis_cents"]))),
+            ]
+            sections = [
+                TableSection(
+                    "Fixed Assets",
+                    ["asset_id", "description", "purchase_date", "cost_cents", "posted_book_depreciation_cents", "book_basis_cents", "tax_basis_cents"],
+                    payload["rows"],
+                    "No fixed assets.",
+                )
+            ]
+        elif descriptor.key == "book_depreciation":
+            metrics = [
+                Metric("Expected", format_money(int(payload["totals"]["expected_book_depreciation_cents"]))),
+                Metric("Posted", format_money(int(payload["totals"]["posted_book_depreciation_cents"]))),
+                Metric("Missing", format_money(int(payload["totals"]["missing_book_depreciation_cents"]))),
+            ]
+            sections = [
+                TableSection(
+                    "Book Depreciation",
+                    ["asset_id", "description", "expected_book_depreciation_cents", "posted_book_depreciation_cents", "missing_book_depreciation_cents"],
+                    payload["rows"],
+                    "No book depreciation.",
+                )
+            ]
+        elif descriptor.key == "tax_depreciation":
+            metrics = [Metric("Tax Depreciation", format_money(int(payload["totals"]["tax_depreciation_cents"])))]
+            sections = [
+                TableSection(
+                    "Tax Depreciation",
+                    ["asset_id", "description", "deduction_type", "amount_cents", "tax_basis_before_cents", "tax_basis_after_cents"],
+                    payload["rows"],
+                    "No tax depreciation.",
+                )
+            ]
+        elif descriptor.key == "depreciation_difference":
+            metrics = [
+                Metric("Book", format_money(int(payload["totals"]["book_depreciation_cents"]))),
+                Metric("Tax", format_money(int(payload["totals"]["tax_depreciation_cents"]))),
+                Metric("Tax Minus Book", format_money(int(payload["totals"]["tax_minus_book_difference_cents"]))),
+            ]
+            sections = [
+                TableSection(
+                    "Depreciation Difference",
+                    ["asset_id", "description", "book_depreciation_cents", "tax_depreciation_cents", "tax_minus_book_difference_cents"],
+                    payload["rows"],
+                    "No depreciation differences.",
+                )
+            ]
         else:
             metrics = [Metric("Accounts", str(len(payload["rows"])))]
             sections = [

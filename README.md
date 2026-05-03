@@ -75,7 +75,46 @@ Normal commands now require the ledger DB to be at the current Alembic head; sch
 - Period close freezes settlement and reconciliation mutations for the closed window until `period reopen` is recorded.
 - Exact one-source owner reimbursements auto-link into cash-basis settlement; ambiguous reimbursement clearing stays manual.
 - `report owner-equity` is now a compatibility alias to the full `equity-rollforward` report.
+- Fixed assets are capitalized to the accrual ledger, with book depreciation posted automatically during `period close`.
+- Tax depreciation is operator-entered advisory support only and never posts to GAAP/book P&L.
 - Accountant packets are advisory handoff bundles, not filing-ready returns.
+
+## Fixed Assets and Depreciation
+
+Add a computer as a capital asset:
+
+```bash
+uv run clawbooks --ledger ./demo asset add \
+  --description "Development computer" \
+  --vendor Apple \
+  --purchase-date 2026-05-03 \
+  --placed-in-service-date 2026-05-03 \
+  --cost 2400.00 \
+  --useful-life-months 36 \
+  --payment-account 1000
+```
+
+Record a CPA-directed 100% tax deduction without changing book P&L:
+
+```bash
+uv run clawbooks --ledger ./demo asset tax set \
+  --asset-id 1 \
+  --year 2026 \
+  --deduction-type section_179 \
+  --amount 2400.00 \
+  --notes "Operator-entered per CPA direction"
+```
+
+Book depreciation is straight-line by month and is posted automatically on `period close` as `Dr 5170 Depreciation Expense`, `Cr 1590 Accumulated Depreciation - Computer Equipment`. Tax depreciation is not posted to the ledger; it appears in advisory reports and accountant packets for preparer review.
+
+Useful reports:
+
+```bash
+uv run clawbooks --ledger ./demo report fixed-assets --as-of 2026-12-31
+uv run clawbooks --ledger ./demo report book-depreciation --period-start 2026-01-01 --period-end 2026-12-31
+uv run clawbooks --ledger ./demo report tax-depreciation --year 2026
+uv run clawbooks --ledger ./demo report depreciation-difference --year 2026
+```
 
 ## Accountant Packet
 

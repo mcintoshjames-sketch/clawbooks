@@ -10,8 +10,11 @@ from typer.testing import CliRunner
 from clawbooks.cli import app
 from clawbooks.db import session_scope
 from clawbooks.models import (
+    AssetBookDepreciationPosting,
+    AssetTaxDepreciation,
     ExternalEvent,
     ExternalEventRefreshHistory,
+    FixedAsset,
     JournalEntry,
     JournalLine,
     ReconciliationLine,
@@ -54,6 +57,9 @@ def test_init_creates_ledger_and_default_accounts(tmp_path: Path) -> None:
     assert result.exit_code == 0
     assert any(row["code"] == "1000" for row in body["data"]["rows"])
     assert any(row["code"] == "2100" for row in body["data"]["rows"])
+    assert any(row["code"] == "1500" for row in body["data"]["rows"])
+    assert any(row["code"] == "1590" for row in body["data"]["rows"])
+    assert any(row["code"] == "5170" for row in body["data"]["rows"])
 
 
 def test_cli_help_hides_dead_flags_and_describes_owner_equity_alias() -> None:
@@ -69,6 +75,209 @@ def test_cli_help_hides_dead_flags_and_describes_owner_equity_alias() -> None:
     assert owner_equity_help.exit_code == 0
     assert "Deprecated alias for equity-rollforward" in owner_equity_help.stdout
     assert "calendar-year-to-date" in owner_equity_help.stdout
+
+
+def test_fixed_asset_close_posts_book_depreciation_once(tmp_path: Path) -> None:
+    ledger = init_ledger(tmp_path)
+    result = invoke(
+        ledger,
+        "asset",
+        "add",
+        "--description",
+        "Computer",
+        "--vendor",
+        "Apple",
+        "--purchase-date",
+        "2026-01-15",
+        "--placed-in-service-date",
+        "2026-01-15",
+        "--cost",
+        "1200.00",
+        "--useful-life-months",
+        "12",
+        "--paid-personally",
+    )
+    assert result.exit_code == 0, result.stdout
+
+    audit_before = payload(
+        invoke(
+            ledger,
+            "period",
+            "audit",
+            "--period-start",
+            "2026-01-01",
+            "--period-end",
+            "2026-01-31",
+        )
+    )
+    assert any(item["id"] == "book_depreciation_would_post" for item in audit_before["data"]["advisory_findings"])
+
+    close = payload(
+        invoke(
+            ledger,
+            "period",
+            "close",
+            "--period-start",
+            "2026-01-01",
+            "--period-end",
+            "2026-01-31",
+            "--reason",
+            "month close",
+        )
+    )
+    assert close["data"]["book_depreciation_postings"][0]["amount_cents"] == 10000
+
+    pnl_body = payload(
+        invoke(
+            ledger,
+            "report",
+            "pnl",
+            "--period-start",
+            "2026-01-01",
+            "--period-end",
+            "2026-01-31",
+            "--basis",
+            "accrual",
+        )
+    )
+    assert pnl_body["data"]["totals"]["expense_cents"] == 10000
+
+    audit_again = invoke(
+        ledger,
+        "period",
+        "audit",
+        "--period-start",
+        "2026-01-01",
+        "--period-end",
+        "2026-01-31",
+    )
+    assert audit_again.exit_code == 0, audit_again.stdout
+    assert not any(item["id"] == "book_depreciation_would_post" for item in payload(audit_again)["data"]["advisory_findings"])
+
+    with session_scope(ledger) as session:
+        assert session.scalar(select(func.count(AssetBookDepreciationPosting.id))) == 1
+        depreciation_entries = session.scalars(select(JournalEntry).where(JournalEntry.source_type == "book_depreciation")).all()
+        assert len(depreciation_entries) == 1
+
+
+def test_asset_tax_depreciation_is_advisory_and_does_not_change_gaap_pnl(tmp_path: Path) -> None:
+    ledger = init_ledger(tmp_path)
+    result = invoke(
+        ledger,
+        "asset",
+        "add",
+        "--description",
+        "Computer",
+        "--purchase-date",
+        "2026-01-15",
+        "--cost",
+        "1200.00",
+        "--paid-personally",
+    )
+    assert result.exit_code == 0, result.stdout
+
+    tax_result = payload(
+        invoke(
+            ledger,
+            "asset",
+            "tax",
+            "set",
+            "--asset-id",
+            "1",
+            "--year",
+            "2026",
+            "--deduction-type",
+            "section_179",
+            "--amount",
+            "1200.00",
+        )
+    )
+    assert tax_result["data"]["tax_depreciation"]["tax_basis_after_cents"] == 0
+
+    pnl_body = payload(
+        invoke(
+            ledger,
+            "report",
+            "pnl",
+            "--period-start",
+            "2026-01-01",
+            "--period-end",
+            "2026-12-31",
+            "--basis",
+            "accrual",
+        )
+    )
+    assert pnl_body["data"]["totals"]["expense_cents"] == 0
+
+    diff_body = payload(invoke(ledger, "report", "depreciation-difference", "--year", "2026"))
+    assert diff_body["data"]["totals"]["tax_depreciation_cents"] == 120000
+    assert diff_body["data"]["totals"]["tax_minus_book_difference_cents"] == 120000
+
+    over = invoke(
+        ledger,
+        "asset",
+        "tax",
+        "set",
+        "--asset-id",
+        "1",
+        "--year",
+        "2026",
+        "--deduction-type",
+        "bonus",
+        "--amount",
+        "0.01",
+    )
+    assert over.exit_code == 2
+
+    with session_scope(ledger) as session:
+        assert session.scalar(select(func.count(AssetTaxDepreciation.id))) == 1
+        assert session.scalar(select(func.count(FixedAsset.id))) == 1
+
+
+def test_monthly_close_does_not_block_advisory_tax_depreciation_entry(tmp_path: Path) -> None:
+    ledger = init_ledger(tmp_path)
+    result = invoke(
+        ledger,
+        "asset",
+        "add",
+        "--description",
+        "Computer",
+        "--purchase-date",
+        "2026-01-15",
+        "--cost",
+        "1200.00",
+        "--paid-personally",
+    )
+    assert result.exit_code == 0, result.stdout
+
+    close = invoke(
+        ledger,
+        "period",
+        "close",
+        "--period-start",
+        "2026-01-01",
+        "--period-end",
+        "2026-01-31",
+        "--reason",
+        "month close",
+    )
+    assert close.exit_code == 0, close.stdout
+
+    tax_result = invoke(
+        ledger,
+        "asset",
+        "tax",
+        "set",
+        "--asset-id",
+        "1",
+        "--year",
+        "2026",
+        "--deduction-type",
+        "section_179",
+        "--amount",
+        "1200.00",
+    )
+    assert tax_result.exit_code == 0, tax_result.stdout
 
 
 def test_unbalanced_journal_returns_validation_error(tmp_path: Path) -> None:

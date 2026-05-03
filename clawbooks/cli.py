@@ -21,17 +21,20 @@ from clawbooks.ledger import (
     UNSET,
     JournalLineInput,
     add_account,
+    add_fixed_asset,
     apply_settlement,
     close_period,
     close_reconciliation,
     create_document,
     deactivate_account,
     get_compliance_profile,
+    get_fixed_asset,
     import_csv,
     import_stripe,
     infer_kind_from_subtype,
     list_accounts,
     list_documents,
+    list_fixed_assets,
     list_reconciliation_sessions,
     list_review_blockers,
     list_sales_tax_payment_slots,
@@ -47,26 +50,32 @@ from clawbooks.ledger import (
     reverse_settlement,
     reverse_entry,
     seed_defaults,
+    set_asset_tax_depreciation,
     set_compliance_profile,
     set_sales_tax_payment_expectation,
     start_reconciliation,
     serialize_document,
     retry_review_blocker,
     update_document,
+    update_fixed_asset,
     void_reconciliation,
 )
 from clawbooks.reports import (
     balance_sheet,
+    book_depreciation_report,
     cash_flow,
+    depreciation_difference_report,
     document_checklist,
     equity_rollforward,
     export_accountant_packet,
     export_bundle,
     export_year_end,
+    fixed_assets_report,
     general_ledger,
     owner_equity,
     pnl,
     reconciliation_summary,
+    tax_depreciation_report,
     tax_liabilities,
     tax_rollforward,
     trial_balance,
@@ -91,6 +100,8 @@ review_app = typer.Typer(no_args_is_help=True)
 compliance_app = typer.Typer(no_args_is_help=True)
 profile_app = typer.Typer(no_args_is_help=True)
 sales_tax_slot_app = typer.Typer(no_args_is_help=True)
+asset_app = typer.Typer(no_args_is_help=True)
+asset_tax_app = typer.Typer(no_args_is_help=True)
 
 app.add_typer(coa_app, name="coa")
 app.add_typer(account_app, name="account")
@@ -108,6 +119,8 @@ app.add_typer(review_app, name="review")
 app.add_typer(compliance_app, name="compliance")
 compliance_app.add_typer(profile_app, name="profile")
 compliance_app.add_typer(sales_tax_slot_app, name="sales-tax-slot")
+app.add_typer(asset_app, name="asset")
+asset_app.add_typer(asset_tax_app, name="tax")
 
 console = Console()
 
@@ -732,6 +745,7 @@ def document_add(
     reconciliation_session_id: int | None = typer.Option(None, "--reconciliation-session-id"),
     tax_obligation_code: str | None = typer.Option(None, "--tax-obligation-code"),
     import_run_id: int | None = typer.Option(None, "--import-run-id"),
+    fixed_asset_id: int | None = typer.Option(None, "--fixed-asset-id"),
     dry_run: bool = typer.Option(False, "--dry-run"),
 ) -> None:
     state: CLIState = ctx.obj
@@ -756,6 +770,7 @@ def document_add(
                     reconciliation_session_id=reconciliation_session_id,
                     tax_obligation_code=tax_obligation_code,
                     import_run_id=import_run_id,
+                    fixed_asset_id=fixed_asset_id,
                 )
             )
         },
@@ -773,6 +788,7 @@ def document_list_command(
     reconciliation_session_id: int | None = typer.Option(None, "--reconciliation-session-id"),
     tax_obligation_code: str | None = typer.Option(None, "--tax-obligation-code"),
     import_run_id: int | None = typer.Option(None, "--import-run-id"),
+    fixed_asset_id: int | None = typer.Option(None, "--fixed-asset-id"),
 ) -> None:
     _run_session_command(
         ctx,
@@ -789,6 +805,7 @@ def document_list_command(
                     reconciliation_session_id=reconciliation_session_id,
                     tax_obligation_code=tax_obligation_code,
                     import_run_id=import_run_id,
+                    fixed_asset_id=fixed_asset_id,
                 )
             ]
         },
@@ -813,6 +830,7 @@ def document_update_command(
     reconciliation_session_id: int | None = typer.Option(None, "--reconciliation-session-id"),
     tax_obligation_code: str | None = typer.Option(None, "--tax-obligation-code"),
     import_run_id: int | None = typer.Option(None, "--import-run-id"),
+    fixed_asset_id: int | None = typer.Option(None, "--fixed-asset-id"),
     dry_run: bool = typer.Option(False, "--dry-run"),
 ) -> None:
     parsed_period_start = UNSET if period_start is None else parse_date(period_start)
@@ -840,6 +858,7 @@ def document_update_command(
                     reconciliation_session_id=reconciliation_session_id,
                     tax_obligation_code=tax_obligation_code,
                     import_run_id=import_run_id,
+                    fixed_asset_id=fixed_asset_id,
                 )
             )
         },
@@ -854,6 +873,177 @@ def document_checklist_command(ctx: typer.Context, year: int = typer.Option(...,
         ctx,
         "document checklist",
         lambda session: document_checklist(session, ledger_dir=state.ledger_dir, year=year),
+    )
+
+
+def _asset_row(asset) -> dict[str, object]:
+    return {
+        "asset_id": asset.id,
+        "description": asset.description,
+        "vendor": asset.vendor,
+        "purchase_date": asset.purchase_date,
+        "placed_in_service_date": asset.placed_in_service_date,
+        "status": asset.status,
+        "cost_cents": asset.cost_cents,
+        "useful_life_months": asset.useful_life_months,
+        "salvage_value_cents": asset.salvage_value_cents,
+        "business_use_percent": asset.business_use_percent,
+        "source_journal_entry_id": asset.source_journal_entry_id,
+    }
+
+
+@asset_app.command("add")
+def asset_add_command(
+    ctx: typer.Context,
+    description: str = typer.Option(..., "--description"),
+    vendor: str | None = typer.Option(None, "--vendor"),
+    purchase_date: str = typer.Option(..., "--purchase-date"),
+    placed_in_service_date: str | None = typer.Option(None, "--placed-in-service-date"),
+    cost: str = typer.Option(..., "--cost"),
+    payment_account_code: str | None = typer.Option("1000", "--payment-account"),
+    paid_personally: bool = typer.Option(False, "--paid-personally"),
+    reimbursement: bool = typer.Option(False, "--reimbursement"),
+    asset_account_code: str = typer.Option("1500", "--asset-account"),
+    accumulated_depreciation_account_code: str = typer.Option("1590", "--accumulated-depreciation-account"),
+    depreciation_expense_account_code: str = typer.Option("5170", "--depreciation-expense-account"),
+    useful_life_months: int = typer.Option(36, "--useful-life-months"),
+    salvage_value: str = typer.Option("0.00", "--salvage-value"),
+    business_use_percent: str | None = typer.Option(None, "--business-use-percent"),
+    notes: str | None = typer.Option(None, "--notes"),
+    receipt_path: Path | None = typer.Option(None, "--receipt-path"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    state: CLIState = ctx.obj
+    purchase = parse_date(purchase_date)
+    placed = parse_date(placed_in_service_date) or purchase
+    _run_session_command(
+        ctx,
+        "asset add",
+        lambda session: add_fixed_asset(
+            session,
+            ledger_dir=state.ledger_dir,
+            description=description,
+            vendor=vendor,
+            purchase_date=purchase,
+            placed_in_service_date=placed,
+            cost=cost,
+            asset_account_code=asset_account_code,
+            accumulated_depreciation_account_code=accumulated_depreciation_account_code,
+            depreciation_expense_account_code=depreciation_expense_account_code,
+            payment_account_code=payment_account_code,
+            paid_personally=paid_personally,
+            reimbursement=reimbursement,
+            useful_life_months=useful_life_months,
+            salvage_value=salvage_value,
+            business_use_percent=business_use_percent,
+            notes=notes,
+            receipt_path=receipt_path,
+            dry_run=dry_run,
+        ),
+        dry_run=dry_run,
+    )
+
+
+@asset_app.command("list")
+def asset_list_command(
+    ctx: typer.Context,
+    include_inactive: bool = typer.Option(False, "--include-inactive"),
+) -> None:
+    _run_session_command(
+        ctx,
+        "asset list",
+        lambda session: {"rows": [_asset_row(asset) for asset in list_fixed_assets(session, include_inactive=include_inactive)]},
+    )
+
+
+@asset_app.command("show")
+def asset_show_command(
+    ctx: typer.Context,
+    asset_id: int = typer.Option(..., "--asset-id"),
+    as_of: str | None = typer.Option(None, "--as-of"),
+) -> None:
+    state: CLIState = ctx.obj
+    value_as_of = _require_as_of(state, as_of)
+    _run_session_command(
+        ctx,
+        "asset show",
+        lambda session: {
+            "asset": _asset_row(get_fixed_asset(session, asset_id)),
+            "fixed_assets": [row for row in fixed_assets_report(session, as_of=value_as_of)["rows"] if row["asset_id"] == asset_id],
+            "book_depreciation": [row for row in book_depreciation_report(session, period_start=date(value_as_of.year, 1, 1), period_end=value_as_of)["rows"] if row["asset_id"] == asset_id],
+            "tax_depreciation": [row for row in tax_depreciation_report(session, year=value_as_of.year)["rows"] if row["asset_id"] == asset_id],
+            "depreciation_difference": [row for row in depreciation_difference_report(session, year=value_as_of.year)["rows"] if row["asset_id"] == asset_id],
+        },
+    )
+
+
+@asset_app.command("update")
+def asset_update_command(
+    ctx: typer.Context,
+    asset_id: int = typer.Option(..., "--asset-id"),
+    description: str | None = typer.Option(None, "--description"),
+    vendor: str | None = typer.Option(None, "--vendor"),
+    notes: str | None = typer.Option(None, "--notes"),
+    clear_vendor: bool = typer.Option(False, "--clear-vendor"),
+    clear_notes: bool = typer.Option(False, "--clear-notes"),
+    status: str | None = typer.Option(None, "--status"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    _run_session_command(
+        ctx,
+        "asset update",
+        lambda session: {
+            "asset": _asset_row(
+                update_fixed_asset(
+                    session,
+                    asset_id=asset_id,
+                    description=description,
+                    vendor=None if clear_vendor else (UNSET if vendor is None else vendor),
+                    notes=None if clear_notes else (UNSET if notes is None else notes),
+                    status=status,
+                )
+            )
+        },
+        dry_run=dry_run,
+    )
+
+
+@asset_tax_app.command("set")
+def asset_tax_set_command(
+    ctx: typer.Context,
+    asset_id: int = typer.Option(..., "--asset-id"),
+    year: int = typer.Option(..., "--year"),
+    deduction_type: str = typer.Option(..., "--deduction-type"),
+    amount: str = typer.Option(..., "--amount"),
+    business_use_percent: str | None = typer.Option(None, "--business-use-percent"),
+    notes: str | None = typer.Option(None, "--notes"),
+    dry_run: bool = typer.Option(False, "--dry-run"),
+) -> None:
+    _run_session_command(
+        ctx,
+        "asset tax set",
+        lambda session: {
+            "tax_depreciation": {
+                "tax_depreciation_id": (
+                    record := set_asset_tax_depreciation(
+                        session,
+                        asset_id=asset_id,
+                        tax_year=year,
+                        deduction_type=deduction_type,
+                        amount=amount,
+                        business_use_percent=business_use_percent,
+                        notes=notes,
+                    )
+                ).id,
+                "asset_id": record.asset_id,
+                "tax_year": record.tax_year,
+                "deduction_type": record.deduction_type,
+                "amount_cents": record.amount_cents,
+                "tax_basis_before_cents": record.tax_basis_before_cents,
+                "tax_basis_after_cents": record.tax_basis_after_cents,
+            }
+        },
+        dry_run=dry_run,
     )
 
 
@@ -1118,6 +1308,47 @@ def report_tax_liabilities(ctx: typer.Context, as_of: str | None = typer.Option(
         ctx,
         "report tax-liabilities",
         lambda session: tax_liabilities(session, as_of=_require_as_of(state, as_of)),
+    )
+
+
+@report_app.command("fixed-assets")
+def report_fixed_assets(ctx: typer.Context, as_of: str | None = typer.Option(None, "--as-of")) -> None:
+    state: CLIState = ctx.obj
+    _run_session_command(
+        ctx,
+        "report fixed-assets",
+        lambda session: fixed_assets_report(session, as_of=_require_as_of(state, as_of)),
+    )
+
+
+@report_app.command("book-depreciation")
+def report_book_depreciation(
+    ctx: typer.Context,
+    period_start: str = typer.Option(..., "--period-start"),
+    period_end: str = typer.Option(..., "--period-end"),
+) -> None:
+    _run_session_command(
+        ctx,
+        "report book-depreciation",
+        lambda session: book_depreciation_report(session, period_start=parse_date(period_start), period_end=parse_date(period_end)),
+    )
+
+
+@report_app.command("tax-depreciation")
+def report_tax_depreciation(ctx: typer.Context, year: int = typer.Option(..., "--year")) -> None:
+    _run_session_command(
+        ctx,
+        "report tax-depreciation",
+        lambda session: tax_depreciation_report(session, year=year),
+    )
+
+
+@report_app.command("depreciation-difference")
+def report_depreciation_difference(ctx: typer.Context, year: int = typer.Option(..., "--year")) -> None:
+    _run_session_command(
+        ctx,
+        "report depreciation-difference",
+        lambda session: depreciation_difference_report(session, year=year),
     )
 
 

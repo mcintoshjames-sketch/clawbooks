@@ -9,6 +9,8 @@ DEFAULT_ACCOUNTS: list[dict[str, str]] = [
     {"code": "1000", "name": "Business Checking", "kind": "asset", "subtype": "bank"},
     {"code": "1010", "name": "Stripe Clearing", "kind": "asset", "subtype": "stripe_clearing"},
     {"code": "1100", "name": "Accounts Receivable", "kind": "asset", "subtype": "receivable"},
+    {"code": "1500", "name": "Computer Equipment", "kind": "asset", "subtype": "fixed_asset"},
+    {"code": "1590", "name": "Accumulated Depreciation - Computer Equipment", "kind": "asset", "subtype": "accumulated_depreciation"},
     {"code": "2000", "name": "Credit Card Payable", "kind": "liability", "subtype": "card"},
     {"code": "2100", "name": "Sales Tax Payable", "kind": "liability", "subtype": "tax_liability"},
     {"code": "2200", "name": "Payroll Tax Payable", "kind": "liability", "subtype": "tax_liability"},
@@ -26,6 +28,7 @@ DEFAULT_ACCOUNTS: list[dict[str, str]] = [
     {"code": "5140", "name": "Taxes and Licenses", "kind": "expense", "subtype": "expense"},
     {"code": "5150", "name": "Contractors", "kind": "expense", "subtype": "expense"},
     {"code": "5160", "name": "Chargebacks", "kind": "expense", "subtype": "expense"},
+    {"code": "5170", "name": "Depreciation Expense", "kind": "expense", "subtype": "expense"},
     {"code": "5199", "name": "Uncategorized Expense", "kind": "expense", "subtype": "expense"},
 ]
 
